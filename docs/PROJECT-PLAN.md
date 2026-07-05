@@ -64,13 +64,16 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │     announcements often link to pages not yet indexed                │
 │  2. Pull current docs.databricks.com context for the subject         │
 │     (Vector Search index) as supplementary grounding                  │
-│  3. Summarize what changed, in plain language, with inline            │
-│     footnote-style citations back to every source URL used            │
-│  4. ai_classify the announcement against the taxonomy of installed    │
-│     skills (skill name + description = the label set, PLUS an         │
-│     always-present "New Feature" bucket for anything that doesn't      │
-│     fit an existing skill) to get a ranked list of affected             │
-│     skill(s)/bucket, each with a confidence score + rationale           │
+│  3. ai_query (not ai_summarize — needs cross-document reasoning over    │
+│     multiple fetched URLs, not single-doc condensation) to synthesize   │
+│     what changed with inline footnote-style citations, returning a      │
+│     structured summary + claims + citations, not free-text prose        │
+│  4. ai_classify (multilabel) the announcement against the taxonomy of  │
+│     installed skills (skill name + description = the label set, PLUS   │
+│     an always-present "New Feature" bucket) to get the affected         │
+│     skill(s)/bucket labels — confidence/rationale are NOT native        │
+│     ai_classify output, so compute those via a separate lightweight     │
+│     LLM step if the review UI needs to show them                        │
 │  5. ai_extract cloud availability (AWS/Azure/GCP) and, for CSP          │
 │     workspaces, compliance-level availability (No CSP, HIPAA,           │
 │     PCI-DSS, FedRAMP Moderate) for the feature, from the fetched         │
@@ -365,6 +368,15 @@ compliance standard. Two dimensions, both extracted by the Research Agent
     Moderate, which only covers 4 `us-*` regions), record that region's
     value as `false`, not `unknown` — the boundary itself is documented
     and definitive, unlike an actual unconfirmed feature-level gap.
+  - **If `ai_extract` is used instead of plain table parsing** (cross-
+    reviewed vs. `databricks-ai-functions`): the tri-state `true`/`false`/
+    `unknown` values should be modeled as an **enum of strings**, not
+    booleans (`ai_extract`'s schema doesn't have a native tri-state
+    boolean); keep the schema within documented limits (≤128 fields,
+    ≤7 nesting levels) by scoping it to just the tracked regions/clouds
+    for this installation rather than every region Databricks supports;
+    and access the returned VARIANT via `result:response:...` path
+    syntax, not plain dot notation.
 - **Not a one-time concern**: like Phase 4's CLI-drift check, compliance/
   cloud availability can change independent of a new RSS announcement
   (e.g. FedRAMP authorization catching up later for an already-GA
@@ -470,6 +482,18 @@ no efficient single-row update.
   Installer) can be exercised against anything other than this original
   repo. Doesn't block Phase 1/2/2b, which are workspace infra and don't
   care which skills repo is configured.
+- **DAB scoping, cross-reviewed vs. `databricks-dabs`**: bundle
+  variables/targets parameterize **deploy-time infra only** (catalog,
+  schema, warehouse ID, volume/job/pipeline/app names, dev/prod
+  workspace targets) — they are not the right place for the
+  per-installation mutable settings this phase collects (GitHub
+  `installation_id`, tracked cloud/region, target skills repo), which
+  live in Lakebase (§1c) after deployment instead. Also: a Databricks
+  App's own runtime environment variables belong in the app's own
+  `app.yaml`, not in the bundle's `databricks.yml`, and a bundle deploy
+  alone can leave the App resource stopped — deployment automation needs
+  to explicitly run/start the App after `bundle deploy`, not assume it
+  starts itself.
 
 ### Phase 1 — Grounding corpus (docs ingestion)
 - Scrape/sync the relevant `docs.databricks.com` sections into a UC Volume,
@@ -484,6 +508,17 @@ no efficient single-row update.
   announcement — the Research Agent always does a live fetch of the
   announcement's own links first (Phase 2). This corpus just gives it
   broader context for the surrounding docs area.
+- **DAB bundling notes (cross-reviewed vs. `databricks-dabs`)**, relevant
+  to Phase 1 and Phase 2b alike: (a) UC Volume resources in the bundle
+  need explicit **`grants`**/UC privileges (e.g. `READ_VOLUME`, write
+  privileges as needed) — not a generic bundle `permissions` block, which
+  applies to job/app/pipeline resources, not volume access; (b) **Vector
+  Search endpoints/indexes are not confirmed as a documented DAB resource
+  type** — verify current `databricks bundle schema` support before
+  assuming the index itself can be declared in the bundle. If unsupported
+  or incomplete, the DAB deploys the jobs/pipelines/app/volumes as usual,
+  and a small **post-deploy setup job** creates or updates the Vector
+  Search endpoint/index idempotently (safe to re-run on every deploy).
 
 ### Phase 2 — RSS ingestion + Research Agent (the event pipeline)
 - **RSS ingestion (event-driven)**: the installation's selected feed(s)
@@ -531,13 +566,35 @@ no efficient single-row update.
     references — never relies solely on the Phase 1 corpus, since
     same-day announcements often link to pages not yet indexed.
   - Citations are first-class output, not an afterthought: every claim in
-    the summary should be traceable to a specific fetched URL.
-  - `ai_classify` needs a maintained taxonomy — the label set is "all
-    currently installed/staged skill names + one-line descriptions," PLUS
-    an always-present **"New Feature"** bucket for announcements that don't
-    fit any existing skill well. This taxonomy must be kept in sync with
-    the skill directory (regenerate it from `SKILL.md` frontmatter each
-    run) and with any user-created buckets (see Phase 3's override flow).
+    the summary should be traceable to a specific fetched URL. Use
+    **`ai_query`**, not `ai_summarize`, for the synthesis step — this
+    needs cross-document reasoning over multiple fetched sources with a
+    citation contract, which is what `ai_query` is documented for;
+    `ai_summarize` is single-document condensation with no citation
+    structure (cross-reviewed vs. `databricks-ai-functions`).
+  - `ai_classify` (**multilabel**) needs a maintained taxonomy — the label
+    set is "all currently installed/staged skill names + one-line
+    descriptions," PLUS an always-present **"New Feature"** bucket for
+    announcements that don't fit any existing skill well. This taxonomy
+    must be kept in sync with the skill directory (regenerate it from
+    `SKILL.md` frontmatter each run) and with any user-created buckets
+    (see Phase 3's override flow). **Guardrails** (cross-reviewed vs.
+    `databricks-ai-functions`' documented limits): keep labels ≤100 chars
+    and descriptions ≤1000 chars each, cap the taxonomy well under the
+    500-label ceiling (merge/archive stale user-created buckets before it
+    gets there), and pass any classification context via the function's
+    `instructions` option rather than folding unbounded taxonomy text
+    into the label list itself. `ai_classify` does **not** natively return
+    a confidence score or rationale — the plan's earlier "ranked list with
+    confidence + rationale" wording overstated what it returns; if the
+    review UI wants those, compute them with a small separate LLM step,
+    not as `ai_classify` output.
+  - Batch AI Function calls (this step and step 3/5) use **non-throwing,
+    error-capturing execution** (e.g. `failOnError => false` where
+    available) rather than aborting the whole run on one bad call — a
+    failed classification/extraction/summary for one entry writes an
+    error payload to a dead-letter/`_errors` table and triggers a Phase 7
+    alert, instead of silently dropping the RSS entry or crashing the Job.
   - Output is always a *proposal* written to a JSON findings file (never a
     direct write to a skill file or straight to Delta — see Phase 2b).
 
@@ -563,10 +620,19 @@ no efficient single-row update.
 
 ### Phase 3 — Review App (the human gate + editor)
 - Databricks App (AppKit + React) reading `research_log` + the skill
-  directory.
+  directory. **Reading `research_log` goes through the Apps Data Access
+  Decision Gate** (cross-reviewed vs. `databricks-apps`): default to
+  warehouse **Analytics** (`config/queries/` + `useAnalyticsQuery`), not a
+  custom endpoint running a raw `SELECT` — that pattern is explicitly
+  discouraged. Only reach for a **Lakebase synced table** (read-only
+  mirror of `research_log`, §1c) if the Analytics path proves too slow
+  for the review queue in practice.
 - Review queue UI: one card per pending research entry, with per-skill
   accept/reject, full diff view, and a markdown editor for hand-editing the
-  proposed text before accepting.
+  proposed text before accepting. **The accept/reject/edit-then-accept
+  click-state itself is CRUD, and lives in Lakebase (§1c)** — it is never
+  written back into the Delta `research_log` table, which stays an
+  append-oriented record fed only by Phase 2b's pipeline.
 - Markdown viewer/editor works on *any* skill file at any time (not just
   ones with a pending proposal) — view current, edit, save back to the
   configured skills repo (§1a) as a PR.
@@ -580,8 +646,15 @@ no efficient single-row update.
   or new-bucket creation re-triggers the skill-update generation step (Phase
   2 step 5) for that entry under the corrected label, rather than just
   relabeling the old proposal — so the proposed diff is always grounded in
-  the label the human actually confirmed, not the model's first guess. A
-  new bucket the user creates becomes a permanent taxonomy entry (and,
+  the label the human actually confirmed, not the model's first guess.
+  **This re-trigger — and any other App→Job call — uses AppKit's `jobs()`
+  plugin** (cross-reviewed vs. `databricks-apps`), never a bespoke
+  Jobs-SDK custom endpoint, and is always **fire-and-poll** (`runNow` then
+  poll run status), never a synchronous run-and-wait: the Apps platform's
+  reverse proxy enforces a hard **120-second per-request timeout**, well
+  under what a full research/classify/extract/diff regeneration run could
+  take.
+  A new bucket the user creates becomes a permanent taxonomy entry (and,
   eventually, a new skill directory) for future classification runs.
 - **Starter-pack check (§1a)**: the same review queue also accepts entries
   from an on-demand "check for latest from `<starter pack>`" action (not
@@ -596,7 +669,11 @@ no efficient single-row update.
   this project manages carries `base_cli_version` (the `aitools`/CLI version
   it started from) and its own independently-incrementing
   `updated_version` / `updated_at`. This never touches or overwrites the
-  CLI's own version string.
+  CLI's own version string. **The queryable version-tracking table this
+  phase's three-way comparison reads/writes lives in Lakebase (§1c)**, not
+  Delta — the `SKILL.md` frontmatter in the repo stays the authoritative
+  source of record, and the Lakebase table is its interactively-queried
+  projection (cross-reviewed vs. `databricks-lakebase`).
 - **Simplified by the CLI investigation**: since skill content is fetched
   by the CLI from the public `databricks/databricks-agent-skills` GitHub
   repo (not bundled in the binary), and `internal/build/cli-compat.json`
@@ -701,9 +778,10 @@ no efficient single-row update.
 |-------|------------------------|
 | Docs corpus + retrieval | `databricks-vector-search`, `databricks-unity-catalog` (volumes) |
 | RSS watcher + Research Agent | `databricks-jobs`, `databricks-ai-functions` (`ai_classify`, `ai_extract`, `ai_query`) |
-| Review App | `databricks-apps`, `databricks-apps-python`, `databricks-app-design` |
+| Per-installation OLTP state (Phase 0, Phase 3, §1c) | `databricks-lakebase` |
+| Review App | `databricks-apps`, `databricks-apps-python`, `databricks-app-design`, `databricks-lakebase` |
 | Knowledge base / MCP server | `databricks-vector-search`, `databricks-model-serving` (if fronting via an endpoint) |
-| Bundling everything | `databricks-dabs` (ship Job + App as one bundle) |
+| Bundling everything | `databricks-dabs` (ship the deployable workspace resources as one bundle: jobs, Lakeflow Declarative Pipelines, the App, UC Volume/schema/table resources where the bundle schema supports them — not just "Job + App") |
 
 ## 4. Suggested build order
 
@@ -772,6 +850,10 @@ availability:                   # see §1b — cloud + region-scoped compliance 
   file's `base_cli_version`/`base_skills_repo_ref` vs. its own
   `metadata.version` tells you exactly who has moved since the shared
   starting point.
+- The App-queryable copy of this tracking data lives in **Lakebase**
+  (§1c, §2 Phase 4) — the frontmatter above, in the repo, remains the
+  single source of truth; Lakebase just gives the App fast, interactive
+  read/write access to it for the three-way comparison UI.
 
 ## 6. Open questions for the repo owner
 
