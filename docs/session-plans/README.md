@@ -21,7 +21,7 @@ an independent sub-agent lens before being marked ready.
 
 | # | Session plan | Phase(s) covered | Status |
 |---|---------------|-------------------|--------|
-| 00 | [`00-workspace-setup-and-repo-configuration.md`](00-workspace-setup-and-repo-configuration.md) | Phase 0 | Draft — pending cross-review |
+| 00 | [`00-workspace-setup-and-repo-configuration.md`](00-workspace-setup-and-repo-configuration.md) | Phase 0 | Cross-reviewed (codex + pi) |
 | 01 | `01-rss-ingestion-and-research-agent.md` | Phase 2 | Not started |
 | 02 | `02-grounding-corpus.md` | Phase 1 | Not started |
 | 03 | `03-findings-ingestion-pipeline.md` | Phase 2b | Not started |
