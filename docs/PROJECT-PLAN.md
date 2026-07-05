@@ -37,15 +37,19 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │ RSS Ingestion (event-driven, not pure polling)                     │
-│  - Three official Databricks Release Notes feeds (AWS/GCP/Azure, §6 #6)│
-│    are each published to Zerobus, landing in a shared bronze Delta   │
-│    table (`rss_bronze`) as they arrive, de-duped on title+link so a  │
-│    cross-cloud announcement doesn't trigger the pipeline 3x           │
+│  - Per-installation cloud selection (§1a): the user picks which of    │
+│    AWS/GCP/Azure feeds (§6 #6) to track, any combination, defaulting  │
+│    to the cloud this installation is deployed on                      │
+│  - The selected feed(s) are each published to Zerobus, landing in a  │
+│    shared bronze Delta table (`rss_bronze`) as they arrive, de-duped  │
+│    on title+link so a cross-cloud announcement (when 2-3 clouds are   │
+│    selected) doesn't trigger the pipeline more than once              │
 │  - Arrival of a new `rss_bronze` row is itself the trigger — either  │
 │    a file/table-arrival-triggered Job run, or a Lakeflow Declarative │
 │    Pipeline flow that fires the Research Agent task per new row      │
-│  - Falls back to a scheduled poll of the RSS feed only if Zerobus    │
-│    ingestion isn't available end-to-end (see open question below)    │
+│  - Falls back to a scheduled poll of the selected feed(s) only if    │
+│    Zerobus ingestion isn't available end-to-end (see open question   │
+│    below)                                                              │
 └───────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -63,13 +67,18 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │     always-present "New Feature" bucket for anything that doesn't      │
 │     fit an existing skill) to get a ranked list of affected             │
 │     skill(s)/bucket, each with a confidence score + rationale           │
-│  5. For each affected skill (or "New Feature" candidate): draft a       │
+│  5. ai_extract cloud availability (AWS/Azure/GCP) and, for CSP          │
+│     workspaces, compliance-level availability (No CSP, HIPAA,           │
+│     PCI-DSS, FedRAMP Moderate) for the feature, from the fetched         │
+│     source(s) — see §1b for the target skill-content format             │
+│  6. For each affected skill (or "New Feature" candidate): draft a       │
 │     proposed SKILL.md/references patch (unified diff) grounded in       │
-│     the summary + citations                                             │
-│  6. Write findings to a JSON file (one per rss entry) in a UC Volume —  │
-│     summary, citations[], skill_classifications[], proposed_diffs[],    │
-│     status ("pending_review") — designed to be auto-loaded by a          │
-│     Lakeflow Declarative Pipeline (streaming, Autoloader-based) into     │
+│     the summary + citations + step 5's availability findings            │
+│  7. Write findings to a JSON file (one per rss entry) in a UC Volume —  │
+│     summary, citations[], skill_classifications[], availability{},      │
+│     proposed_diffs[], status ("pending_review") — designed to be         │
+│     auto-loaded by a Lakeflow Declarative Pipeline (streaming,           │
+│     Autoloader-based) into                                              │
 │     `research_log` and the Vector Search index, rather than written      │
 │     directly to Delta from the agent itself                              │
 └───────────────────────────────────────────────────────────────────┘
@@ -225,11 +234,66 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   0's pack registry must persist a live `source repo + ref` per
   installation (not just perform a point-in-time copy at setup), so it can
   be re-diffed on demand.
+- **Cloud tracking selection** (also per-installation config, alongside the
+  repo connection above): the user chooses which of the three Release
+  Notes feeds (§6 #6 — AWS/GCP/Azure) this installation ingests, any
+  combination including all three, defaulting to **the cloud this
+  installation is deployed on** (auto-detected — mechanism TBD, see §6 new
+  open question). Changeable later in settings, same as the repo
+  connection. This is the one piece of Phase 0 config that DOES reach into
+  the RSS/Research Agent pipeline (§1, Phase 2) — everything else there
+  remains workspace infra untouched by which skills repo is configured.
 - This has no effect on Phase 4's CLI-drift logic (still comparing against
   the public `databricks-agent-skills` repo, independent of which skills
-  repo this installation is configured to use) or on the RSS/Research
-  Agent pipeline (workspace infra, not repo-specific) — it only changes
-  *which repo* Phase 3's accept flow and Phase 5's Local Installer target.
+  repo this installation is configured to use) — it only changes *which
+  repo* Phase 3's accept flow and Phase 5's Local Installer target, and
+  (via the cloud-tracking selection above) *which RSS feeds* Phase 2
+  ingests for this installation.
+
+## 1b. Skill content: cloud + compliance availability
+
+Skills should state not just *what* a feature does but *where it's usable*
+— by cloud, and for CSP (Compliance Security Profile) workspaces, by
+compliance standard. Two dimensions, both extracted by the Research Agent
+(§1, step 5) from the same fetched sources used for the summary/citations:
+
+- **Cloud availability**: AWS / Azure / GCP, independent of which feeds
+  this installation happens to track (§1a) — a feature announced only on
+  the AWS feed but later confirmed available on Azure too should still
+  record Azure availability if the fetched docs say so.
+- **Compliance-level availability**, for CSP workspaces specifically:
+  **No CSP** (standard workspace), **HIPAA**, **PCI-DSS**, and **FedRAMP
+  Moderate**. Feature availability at these compliance levels can lag
+  general availability significantly, and is exactly the kind of detail a
+  human coding against a skill would otherwise have to go re-check by hand
+  — which is the whole reason this project exists.
+- **Format** (proposed, pending the docs-source investigation in §6): each
+  skill carries a structured **availability block** (frontmatter, so it's
+  both machine-filterable and renders in the App's Skill Library browser)
+  alongside a human-readable summary in the skill body:
+  ```yaml
+  availability:
+    clouds: [aws, azure, gcp]           # or a subset
+    compliance:
+      no_csp: true
+      hipaa: true
+      pci_dss: false
+      fedramp_moderate: unknown        # not yet confirmed either way
+  ```
+  `unknown` (not just `true`/`false`) matters here: the Research Agent
+  should never assert compliance availability it didn't actually find
+  evidence for — absence of a mention is not evidence of unavailability.
+- **Extraction mechanism**: `ai_extract` (not `ai_classify`, which is
+  already used for skill routing §1 step 4) against the fetched
+  announcement + linked docs, per skill/feature. Depends on the docs-source
+  investigation in §6 to know what to point it at and how reliably
+  compliance info is actually documented per-feature.
+- **Not a one-time concern**: like Phase 4's CLI-drift check, compliance/
+  cloud availability can change independent of a new RSS announcement
+  (e.g. FedRAMP authorization catching up later for an already-GA
+  feature). A periodic re-check of existing skills' availability blocks
+  against current docs is a plausible future phase, not required for MVP
+  — tracked as a stretch idea, not yet a numbered phase.
 
 ## 2. Build phases
 
@@ -436,7 +500,7 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
 | Phase | Relevant staged skill |
 |-------|------------------------|
 | Docs corpus + retrieval | `databricks-vector-search`, `databricks-unity-catalog` (volumes) |
-| RSS watcher + Research Agent | `databricks-jobs`, `databricks-ai-functions` (`ai_classify`, `ai_query`) |
+| RSS watcher + Research Agent | `databricks-jobs`, `databricks-ai-functions` (`ai_classify`, `ai_extract`, `ai_query`) |
 | Review App | `databricks-apps`, `databricks-apps-python`, `databricks-app-design` |
 | Knowledge base / MCP server | `databricks-vector-search`, `databricks-model-serving` (if fronting via an endpoint) |
 | Bundling everything | `databricks-dabs` (ship Job + App as one bundle) |
@@ -481,6 +545,13 @@ base_cli_version: "1.5.0"       # aitools/CLI version this skill's content start
 base_skills_repo_ref: "v1.5.0" # the databricks-agent-skills ref that base_cli_version resolved to, via cli-compat.json
 updated_at: "2026-07-05T00:00:00Z"
 last_research_log_id: "rl_00042"
+availability:                   # see §1b — cloud + compliance-level support, extracted by the Research Agent
+  clouds: [aws, azure, gcp]
+  compliance:
+    no_csp: true
+    hipaa: true
+    pci_dss: false
+    fedramp_moderate: unknown
 ```
 
 - `base_cli_version` + `base_skills_repo_ref` are set once, at the point a
@@ -602,17 +673,18 @@ last_research_log_id: "rl_00042"
      Docusaurus RSS generator. Each `<item>` has `<title>`, a deep-linked
      `<link>` into the dated release-notes page/section, and a
      day-granularity `<pubDate>`.
-   - **Decision: ingest all three feeds**, not just AWS, since some
-     announcements are cloud-specific and this project's goal is
-     accuracy across all clouds. Content overlaps heavily across the
-     three, so ingestion needs to **de-dupe on title + link** (or a hash
-     of both) before an entry reaches `rss_bronze`/triggers the Research
-     Agent — otherwise a cross-cloud feature announcement fires the
-     pipeline three times for the same underlying change. This means
-     Phase 2's RSS ingestion is a **fan-out of three producers into one
-     `rss_bronze` table with a dedup key**, not a single producer.
-   - Revisit narrowing to AWS-only if the three-feed dedup proves more
-     complexity than it's worth in practice.
+   - **Decision (revised): user-selectable per installation, not fixed**
+     (§1a). Each installation picks any combination of the three feeds to
+     track, defaulting to the cloud it's deployed on (auto-detection
+     mechanism: see new open question #10 below). All three selectable at
+     once remains supported. Content overlaps heavily across clouds, so
+     whenever 2+ feeds are selected, ingestion still needs to **de-dupe on
+     title + link** (or a hash of both) before an entry reaches
+     `rss_bronze`/triggers the Research Agent — otherwise a cross-cloud
+     announcement fires the pipeline more than once for the same
+     underlying change. Phase 2's RSS ingestion is therefore a **fan-out of
+     1-3 producers (per the installation's selection) into one
+     `rss_bronze` table with a dedup key**.
 7. ~~Pi's local skill directory convention~~ — **Dropped for now, per repo
    owner**: Phase 5's Local Installer targets exactly the CLI's own
    supported agent set (Claude Code, Cursor, Codex CLI, OpenCode, GitHub
@@ -638,3 +710,14 @@ last_research_log_id: "rl_00042"
    current source content and feeds the result into the same review queue
    as RSS-driven proposals, with the same accept/reject/edit-then-accept
    options. Reflected in §1a and Phase 3 above.
+10. **Auto-detecting the deployment cloud** (§1a, §6 #6): what's the most
+    reliable way for code running inside a Databricks App to determine
+    whether it's deployed on AWS, Azure, or GCP, to use as the default
+    cloud-tracking selection? Dispatched for investigation
+    (`explore-detect-workspace-cloud-provider`); pending result.
+11. **Compliance-availability docs source** (§1b): does Databricks publish
+    a structured per-feature compliance-profile (HIPAA/PCI-DSS/FedRAMP
+    Moderate) support matrix, or is this only ever documented ad hoc/prose
+    per feature page, requiring `ai_extract` to read it out per-feature
+    with no structured source to lean on? Dispatched for investigation
+    (`databricks-compliance-availability-docs`); pending result.
