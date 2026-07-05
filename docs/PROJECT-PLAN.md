@@ -546,14 +546,32 @@ last_research_log_id: "rl_00042"
      than importing the CLI's.
    - `aitools` (and this whole mechanism) shipped in CLI `v1.5.0`
      (`CHANGELOG.md:25/139`).
-4. **Upstream fix path** — **partially resolved as a side effect of #3**:
-   the source-of-truth repo is confirmed public: `github.com/databricks/
-   databricks-agent-skills`. So the mechanism for an upstream PR is no
-   longer unknown — what's still undecided is whether this project should
-   actually open PRs there once proposals are proven out. **Still marked as
-   a nice-to-have, not a blocker per repo owner** — revisit after the core
-   loop (Phases 1–5) works, but the path is no longer blocked on
-   discovering where to send it.
+4. ~~Upstream fix path~~ — **Resolved, scope narrowed**: the source-of-truth
+   repo is confirmed public (`github.com/databricks/databricks-agent-
+   skills`), and **per repo owner, this is an owner-only capability, not a
+   general product feature** — the app will never open upstream PRs on
+   behalf of any other installation/user, only (potentially) for the repo
+   owner's own installation. This substantially narrows what §2's earlier
+   "what's needed" breakdown requires:
+   - **No per-user opt-in UI, no per-user auth flow.** Drop the "Also
+     propose upstream" review-card action and the fork-based per-user
+     OAuth flow entirely from the general product surface — those were
+     only needed if every installation could trigger this.
+   - **Auth is a single, fixed identity**: the owner's own GitHub account
+     (personal OAuth token or PAT, used only for this one maintainer-only
+     flow), completely separate from Phase 0's per-installation GitHub
+     App, and never distributed to other installations.
+   - **Gated by an identity/role check** on the installation itself — the
+     upstream-PR action (if built) should only render/execute when the
+     running installation is the owner's own, not exposed as a toggle any
+     other user could enable.
+   - **Still needs the content-translation step and the investigation into
+     `databricks-agent-skills`'s contribution policy/schema** from §2's
+     breakdown — those don't go away, they're just now scoped to a single
+     fixed contributor identity instead of N users' identities.
+   - **Still a nice-to-have, lowest priority** — build after Phases 1–5,
+     as an admin/maintainer-only tool separate from the mainline
+     multi-tenant Phase 0–5 product surface, not bundled into it.
 5. ~~New-skill detection~~ — **Resolved**: `ai_classify`'s taxonomy always
    includes an explicit **"New Feature"** bucket for announcements that
    don't fit an existing skill well, and the App lets a user override any
