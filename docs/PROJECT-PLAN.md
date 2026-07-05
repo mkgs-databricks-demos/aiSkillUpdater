@@ -242,9 +242,22 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   combination including all three, defaulting to **the cloud this
   installation is deployed on** (auto-detected via
   `WorkspaceClient().config.cloud` — resolved, see §6 #10). Changeable
-  later in settings, same as the repo connection. This is the one piece of
-  Phase 0 config that DOES reach into
-  the RSS/Research Agent pipeline (§1, Phase 2) — everything else there
+  later in settings, same as the repo connection.
+- **Region tracking selection**, alongside cloud selection: since
+  compliance-standard availability (§1b) is itself region-scoped (the
+  Databricks compliance docs publish Feature × Region matrices, not a
+  single yes/no per standard), the user also picks **which region(s),
+  within their selected cloud(s), they actually care about** for
+  feature-availability tracking — not "all regions everywhere," which
+  would bloat every skill's availability data with regions the user will
+  never deploy to. Defaults to **this installation's own deployment
+  region**, auto-detected (mechanism: see new open question — dispatched
+  for investigation, `detect-workspace-region`). Multi-select supported
+  (a user managing workloads in two AWS regions can track both).
+  Changeable later in settings, same as cloud selection.
+- These two selections (cloud + region) are the pieces of Phase 0 config
+  that reach into the RSS/Research Agent pipeline (§1, Phase 2) and the
+  availability model (§1b) — everything else there
   remains workspace infra untouched by which skills repo is configured.
 - This has no effect on Phase 4's CLI-drift logic (still comparing against
   the public `databricks-agent-skills` repo, independent of which skills
@@ -270,22 +283,40 @@ compliance standard. Two dimensions, both extracted by the Research Agent
   general availability significantly, and is exactly the kind of detail a
   human coding against a skill would otherwise have to go re-check by hand
   — which is the whole reason this project exists.
-- **Format** (proposed, pending the docs-source investigation in §6): each
-  skill carries a structured **availability block** (frontmatter, so it's
-  both machine-filterable and renders in the App's Skill Library browser)
+- **Region tracking** (§1a): since compliance-standard support is itself
+  region-scoped, not just standard-scoped (the Databricks compliance docs
+  publish Feature × Region matrices per standard, not a single yes/no), the
+  user selects which region(s) within their tracked cloud(s) they care
+  about. Availability is tracked **per tracked region**, not flattened
+  into one boolean per standard — see the format below.
+- **Format** (revised to be region-scoped): each skill carries a
+  structured **availability block** (frontmatter, so it's both
+  machine-filterable and renders in the App's Skill Library browser)
   alongside a human-readable summary in the skill body:
   ```yaml
   availability:
     clouds: [aws, azure, gcp]           # or a subset
-    compliance:
-      no_csp: true
-      hipaa: true
-      pci_dss: false
-      fedramp_moderate: unknown        # not yet confirmed either way
+    compliance:                          # keyed by this installation's tracked regions only (§1a) — not every region Databricks supports
+      no_csp:
+        us-west-2: true
+        us-east-1: true
+      hipaa:
+        us-west-2: true
+        us-east-1: true
+      pci_dss:
+        us-west-2: true
+        us-east-1: unknown              # not yet confirmed either way
+      fedramp_moderate:
+        us-west-2: true
+        us-east-1: false
   ```
   `unknown` (not just `true`/`false`) matters here: the Research Agent
   should never assert compliance availability it didn't actually find
   evidence for — absence of a mention is not evidence of unavailability.
+  Only tracked regions are populated — if the user later adds a new
+  tracked region, existing skills' availability blocks gain a new key
+  (re-extracted, not assumed) for that region rather than the schema
+  needing to change.
 - **Extraction mechanism (resolved, §6 #11)**: Databricks publishes
   structured, scrapable **"Regional support for features" HTML tables**,
   one per compliance standard (Feature × Region grid) — not a JSON/API
@@ -300,28 +331,27 @@ compliance standard. Two dimensions, both extracted by the Research Agent
     (`docs.databricks.com/aws/en/security/privacy/security-profile`) for
     features still in preview.
   These three standard pages are the **primary, most authoritative
-  source** — `ai_extract` (or plain table-parsing, arguably more reliable
-  than an LLM call for a fixed HTML table) reads a feature's row across
-  all three pages. This is a **periodic reference fetch**, not something
-  tied to a specific RSS announcement's linked URLs — the Research Agent
-  should check these three fixed pages for the classified feature
-  regardless of what the announcement itself links to. Individual
-  feature/release-notes pages *sometimes* also carry their own compliance
-  notes (e.g. the Model Serving limits page has its own region × standard
-  table), but coverage there is inconsistent/ad hoc — useful as a
-  secondary confirmation when an announcement happens to link to one, not
-  something to rely on as a primary source.
-  - **Nuance not captured by the proposed boolean/`unknown` frontmatter
-    (§1b)**: these tables are actually **Feature × Region** within a given
-    standard (e.g. FedRAMP Moderate only covers 4 specific `us-*` AWS
-    regions; PCI-DSS covers 16). A skill saying `pci_dss: true` is
-    slightly lossy versus "true, in these specific regions." Acceptable
-    simplification for MVP (a coding skill doesn't usually need
-    region-level granularity), but worth a note in the skill's rendered
-    body text even if the frontmatter itself stays boolean.
+  source**, and their Feature × Region shape is exactly what the
+  region-scoped extraction above needs — `ai_extract` (or plain
+  table-parsing, arguably more reliable than an LLM call for a fixed HTML
+  table) reads a feature's row, filtered down to just this installation's
+  **tracked regions** (§1a), across all three pages. This is a **periodic
+  reference fetch**, not something tied to a specific RSS announcement's
+  linked URLs — the Research Agent should check these three fixed pages
+  for the classified feature regardless of what the announcement itself
+  links to. Individual feature/release-notes pages *sometimes* also carry
+  their own compliance notes (e.g. the Model Serving limits page has its
+  own region × standard table), but coverage there is inconsistent/ad hoc
+  — useful as a secondary confirmation when an announcement happens to
+  link to one, not something to rely on as a primary source.
   - The FedRAMP Moderate page itself warns features may be listed as
     available before they're actually released — treat as directional,
     not a hard guarantee, and say so in any skill content that cites it.
+  - If a tracked region isn't a compliance standard's authorization
+    boundary at all (e.g. a tracked `eu-west-1` region against FedRAMP
+    Moderate, which only covers 4 `us-*` regions), record that region's
+    value as `false`, not `unknown` — the boundary itself is documented
+    and definitive, unlike an actual unconfirmed feature-level gap.
 - **Not a one-time concern**: like Phase 4's CLI-drift check, compliance/
   cloud availability can change independent of a new RSS announcement
   (e.g. FedRAMP authorization catching up later for an already-GA
@@ -334,8 +364,9 @@ compliance standard. Two dimensions, both extracted by the Research Agent
 ### Phase 0 — Workspace setup / repo configuration
 - First-run onboarding flow per §1a: connect a GitHub repo via a **GitHub
   App**, choose "start from scratch" vs. "seed from a starter pack" (with
-  "Matt's version" as the first available pack), and store the resolved
-  repo + installation config.
+  "Matt's version" as the first available pack), pick tracked cloud(s) +
+  region(s) (§1a, defaulting to this installation's deployment cloud +
+  region), and store the resolved repo + installation config.
 - Two-part GitHub App provisioning (resolved, §1a and §6 #8), both build
   tasks for this phase:
   1. **App-level, one-time**: an admin setup screen implementing GitHub's
@@ -582,13 +613,17 @@ base_cli_version: "1.5.0"       # aitools/CLI version this skill's content start
 base_skills_repo_ref: "v1.5.0" # the databricks-agent-skills ref that base_cli_version resolved to, via cli-compat.json
 updated_at: "2026-07-05T00:00:00Z"
 last_research_log_id: "rl_00042"
-availability:                   # see §1b — cloud + compliance-level support, extracted by the Research Agent
+availability:                   # see §1b — cloud + region-scoped compliance support, extracted by the Research Agent
   clouds: [aws, azure, gcp]
-  compliance:
-    no_csp: true
-    hipaa: true
-    pci_dss: false
-    fedramp_moderate: unknown
+  compliance:                    # keyed by this installation's tracked regions (§1a)
+    no_csp:
+      us-west-2: true
+    hipaa:
+      us-west-2: true
+    pci_dss:
+      us-west-2: false
+    fedramp_moderate:
+      us-west-2: unknown
 ```
 
 - `base_cli_version` + `base_skills_repo_ref` are set once, at the point a
@@ -777,3 +812,9 @@ availability:                   # see §1b — cloud + compliance-level support,
     too, but that coverage is inconsistent — the three standard pages are
     the authoritative primary source. Exact URLs and the extraction
     approach are now in §1b above.
+12. **Auto-detecting the deployment region** (§1a): what's the most
+    reliable way for code running inside a Databricks App to determine
+    which specific region (e.g. `us-west-2`, `eastus2`) the workspace is
+    deployed in, to use as the default tracked-region selection alongside
+    §6 #10's cloud detection? Dispatched for investigation
+    (`detect-workspace-region`); pending result.
