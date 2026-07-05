@@ -91,9 +91,10 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 ┌───────────────────────────────────────────────────────────────────┐
 │ Ingestion Pipeline (Lakeflow Declarative Pipeline, streaming)       │
 │  - Autoloader watches the JSON findings volume → bronze → silver     │
-│    (`research_log` Delta table); a Delta Sync Vector Search index     │
-│    (managed embeddings, TRIGGERED) syncs from `research_log` — the    │
-│    pipeline never manually upserts the index                          │
+│    (`research_log` Delta table, normal write, no custom Sink); a      │
+│    Delta Sync Vector Search index (managed embeddings, TRIGGERED)     │
+│    exists on `research_log`, and the pipeline calls `sync_index()`    │
+│    after each batch (TRIGGERED needs an explicit call, not automatic) │
 │  - Decouples "agent writes a file" from "data lands in queryable      │
 │    tables + search index", so the Research Agent task stays simple    │
 │    and idempotent (just write a JSON file)                            │
@@ -211,11 +212,12 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
      redirects to GitHub's own **App installation** picker (scoped to
      choosing an org/repo to install the app on) and back to the App with
      an `installation_id`. The App stores that ID against this
-     installation's config (a small state table, not a secret — the ID
-     alone isn't a credential) and mints short-lived **installation access
-     tokens** on-demand server-side whenever it needs to commit or open a
-     PR. No PAT, and no long-lived credential the user has to generate or
-     paste themselves.
+     installation's config in **Lakebase** (§1c — not a secret, the ID
+     alone isn't a credential; not Delta either, this is per-installation
+     OLTP state) and mints short-lived **installation access tokens**
+     on-demand server-side whenever it needs to commit or open a PR. No
+     PAT, and no long-lived credential the user has to generate or paste
+     themselves.
   - **Honest caveat**: GitHub requires the human's consent click to happen
      on `github.com` itself for both flows (the manifest confirm screen,
      and the install-picker) — that's an unavoidable, by-design part of
@@ -370,6 +372,54 @@ compliance standard. Two dimensions, both extracted by the Research Agent
   against current docs is a plausible future phase, not required for MVP
   — tracked as a stretch idea, not yet a numbered phase.
 
+## 1c. State storage: Lakebase for OLTP config/state
+
+**Cross-review finding (real design gap, not a refinement)**: the plan
+previously stored *everything* — including small, per-installation,
+frequently-mutated config — in Delta tables. Both `databricks-apps` and
+`databricks-lakebase` route exactly that profile ("app-specific
+metadata/config," "low-latency transactional CRUD," "user session data")
+to **Lakebase** (autoscaling Postgres, scale-to-zero), not Delta, which is
+designed for append/analytical workloads with high per-commit latency and
+no efficient single-row update.
+
+- **Moves to Lakebase**:
+  - The GitHub App `installation_id` → repo-config mapping (§1a)
+  - The starter-pack registry (pack name → source repo + ref, persisted
+    for on-demand re-diff per §1a's "live reference source" design)
+  - Cloud + region tracking selections (§1a)
+  - Review-queue state: per-skill accept/reject/edit-then-accept status,
+    classification overrides, and user-created taxonomy buckets (Phase 3)
+  - The version-tracking table used for Phase 4's three-way CLI-drift
+    comparison (§5) — the `SKILL.md` frontmatter in the repo remains the
+    **authoritative source of record**; the Lakebase table is its
+    queryable projection for the App to read/write interactively
+- **Stays in Delta/UC — explicitly NOT moved**: `rss_bronze`, `rss_silver`,
+  `research_log`, the docs corpus, and the Vector Search source tables.
+  These are append-only/Autoloader-streamed/analytical, and `research_log`
+  backs the Delta Sync index (§2 Phase 2b) — moving them to Lakebase would
+  break the streaming ingestion and the managed Vector Search sync.
+- **Optional bridge, not a replacement**: if the Phase 3 review-queue UI
+  needs `research_log` rows at operational (sub-second) latency rather
+  than warehouse-query latency, use a **Lakebase synced table** (read-only
+  mirror of `research_log`) rather than relocating the source. Caveats to
+  design around: synced tables are **read-only** in Postgres (writes
+  corrupt the sync), the App's service principal needs an **explicit
+  GRANT** to read them (`CAN_CONNECT_AND_CREATE` alone isn't enough),
+  row/column-level access control is **not propagated** through the sync,
+  and creation goes through `databricks postgres create-synced-table`
+  (not a DAB `synced_database_tables` resource, per §1a's use of
+  autoscaling Lakebase). Default to it only if plain warehouse Analytics
+  reads (§2 Phase 3) prove too slow in practice — don't reach for it
+  up front.
+- **Deploy-first schema ownership**: per Lakebase's model, the App's
+  service principal must **deploy before any local dev** against these
+  tables, since it creates and owns its own Postgres schema on first
+  deploy. Running local dev against the schema before that first deploy
+  fails with a permissions error (`42501`), not a helpful "not set up yet"
+  message — worth calling out explicitly in Phase 0's build tasks so it
+  isn't a surprise.
+
 ## 2. Build phases
 
 ### Phase 0 — Workspace setup / repo configuration
@@ -388,12 +438,10 @@ compliance standard. Two dimensions, both extracted by the Research Agent
      run once per deployment of this project, not per installation.
   2. **Per-installation**: a "Connect GitHub repo" button that redirects to
      GitHub's App installation picker and back with an `installation_id`,
-     stored in a small per-installation state table. Installation access
-     tokens are minted on-demand server-side from then on — no PAT ever
-     stored or handled.
-- **Two Databricks Apps platform constraints confirmed by cross-review**
-  (vs. `databricks-apps`/`databricks-apps-python`) that both build tasks
-  above need to account for:
+     stored in **Lakebase** (§1c). Installation access tokens are minted
+     on-demand server-side from then on — no PAT ever stored or handled.
+- **Three Databricks platform constraints confirmed by cross-review** that
+  the build tasks above need to account for:
   - GitHub's redirect/callback URLs must be registered against the
     deployed App's **public `*.databricksapps.com` host** (Azure:
     `*.azure.databricksapps.com`) — obtained only after first deploy, not
@@ -407,7 +455,16 @@ compliance standard. Two dimensions, both extracted by the Research Agent
     declared permission, so this must be explicitly elevated. Also: the
     App's filesystem is ephemeral, so nothing (including these
     credentials) can be cached to local disk between restarts — always
-    read from the secret scope.
+    read from the secret scope. If the DAB schema doesn't support secret
+    *values* as a declared resource, the bundle should only define the
+    scope itself (if supported); actual GitHub private key/client secret
+    values are always provisioned at first-run by the App backend, never
+    stored in bundle YAML.
+  - **Lakebase deploy-first schema ownership** (§1c): the App's service
+    principal must deploy at least once before any local dev touches its
+    Lakebase tables, since it creates and owns its Postgres schema on
+    first deploy — local dev against the schema beforehand fails with a
+    bare permissions error (`42501`), not a helpful message.
 - Blocks every later phase that reads or writes skill files, so needs to
   exist before Phase 3 (Review App accept flow) or Phase 5 (Local
   Installer) can be exercised against anything other than this original
@@ -488,14 +545,17 @@ compliance standard. Two dimensions, both extracted by the Research Agent
 - A Lakeflow Declarative Pipeline (streaming, Autoloader) watches the JSON
   findings volume the Research Agent writes to and loads it: bronze (raw
   JSON) → silver (`research_log` Delta table, one row per skill
-  classification per RSS entry) → embeds the proposed-diff/summary text
-  and upserts the Vector Search index. **The embed+upsert step is a
-  `ForEachBatch Sink`** (Public Preview) with custom Python logic calling
-  the Vector Search index update API, not a plain Sink — Vector Search
-  isn't a natively-documented Sink target, and upsert semantics don't fit
-  a generic Sink's append-only framing (cross-reviewed vs.
-  `databricks-pipelines`). The plain Delta write to `research_log` stays a
-  normal streaming write, distinct from this custom sink step.
+  classification per RSS entry). **Correction after resolving a conflict
+  between two cross-reviews**: the LDP only ever writes normal rows to
+  `research_log` — it does **not** use a `ForEachBatch Sink` to manually
+  call the Vector Search API (an earlier draft of this plan said that;
+  that pattern is for Direct Access/manual-CRUD indexes, not this design).
+  A separate **Delta Sync index (managed embeddings) with
+  `pipeline_type: TRIGGERED`** is declared on `research_log`; because
+  `TRIGGERED` syncs on-demand rather than automatically on every table
+  change, the pipeline's final step calls the Vector Search
+  `sync_index()` API after each batch lands in `research_log`, rather
+  than relying on it to happen for free.
 - This keeps the Research Agent task itself simple and idempotent (just
   write a file); all the "land it in tables and make it searchable" logic
   lives in one reusable streaming pipeline instead of being duplicated
