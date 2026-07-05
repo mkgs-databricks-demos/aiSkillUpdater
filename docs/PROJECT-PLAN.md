@@ -642,6 +642,43 @@ no efficient single-row update.
   compute-tier requirement, so there's no fallback-to-classic case to plan
   for here (that concern was specific to the Zerobus SDK's own egress
   behavior, which is no longer part of this pipeline).
+- **Why this isn't a Lakeflow Declarative Pipeline (LDP) dataset using
+  `http_request`, investigated directly** — considered and rejected on
+  three independent grounds, not just style preference:
+  1. **`http_request` can't even carry the cursor.** Its return type is
+     `STRUCT<status_code INT, text STRING>` only — no response headers
+     are exposed, so `ETag`/`Last-Modified` from a `200` response can
+     never be read back to save for next time. Conditional GET is
+     impossible with this function regardless of where it runs.
+  2. **It's explicitly scoped away from this workload.** Per its own
+     docs: *"designed for interactive and agent-based use cases, not for
+     high-volume batch queries... For new code, Databricks recommends
+     using the Unity Catalog connections proxy endpoint with the
+     provider's SDK instead."* It also requires a pre-created UC HTTP
+     `CONNECTION` object (admin-provisioned, `USE CONNECTION` grant) as
+     a new piece of per-installation setup this design doesn't otherwise
+     need.
+  3. **LDP's execution model actively fights a side-effecting HTTP call
+     inside a dataset definition, independent of which function makes
+     the call.** No documented LDP source type is HTTP-based (Auto
+     Loader/Kafka/Kinesis/Pub-Sub/Pulsar/Event Hubs/JDBC/Delta/custom
+     data source only — no REST/HTTP entry). Pipelines retry at the
+     task, flow, *and* pipeline level on transient failure, and a full
+     refresh re-runs the whole dataset — either can silently re-issue
+     the same "fetch" multiple times with no exactly-once guarantee.
+     Worse, saving the new cursor back is a read-*then-write* of
+     external state, which the declarative dataset model doesn't
+     support mid-flow (a dataset function returns a DataFrame; the only
+     sanctioned external-write path, a `Sink`, is append-only streaming,
+     not a point read-modify-write of one cursor row). A `TRIGGERED`
+     pipeline also has no native schedule of its own either way — "daily"
+     still has to come from a Jobs schedule wrapping it.
+
+  A plain Job task has none of these problems: it reads status code
+  *and* headers from any HTTP client, freely does imperative
+  read-cursor → conditional-GET → append → write-cursor once per run,
+  and needs no UC Connection object. LDP stays doing exactly what it's
+  built for — the downstream `rss_bronze` → `rss_silver` dedup transform.
 - **Research Agent** (one run per new `rss_silver` row): per the
   architecture diagram above. Key design points:
   - Always does a LIVE fetch of the announcement body + every link it
