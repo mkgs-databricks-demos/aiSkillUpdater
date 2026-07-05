@@ -43,12 +43,14 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │  - The selected feed(s) are each published to Zerobus, landing in a  │
 │    shared bronze Delta table (`rss_bronze`) — raw, append-only, no    │
 │    dedup logic at this layer, exactly as received                     │
-│  - A silver step (`rss_silver`) de-dupes on title+link (or a hash of │
-│    both) so a cross-cloud announcement (when 2-3 clouds are selected)│
-│    doesn't trigger the pipeline more than once                        │
-│  - Arrival of a new `rss_silver` row is itself the trigger — either  │
-│    a file/table-arrival-triggered Job run, or a Lakeflow Declarative │
-│    Pipeline flow that fires the Research Agent task per new row      │
+│  - A silver step (`rss_silver`) de-dupes on title+link within a time │
+│    window keyed off pubDate (bounded state, not a global keep-first)  │
+│    so a cross-cloud announcement (2-3 clouds selected) doesn't        │
+│    trigger the pipeline more than once                                │
+│  - Arrival of a new `rss_silver` row is the trigger, via a            │
+│    file/table-arrival-triggered Job run (the sole mechanism — an LDP  │
+│    flow cannot itself invoke a Job/agent as a side effect, only write │
+│    to Streaming Tables/MVs/Sinks; cross-reviewed vs. §6 #13)          │
 │  - Falls back to a scheduled poll of the selected feed(s) only if    │
 │    Zerobus ingestion isn't available end-to-end (see open question   │
 │    below)                                                              │
@@ -412,16 +414,37 @@ compliance standard. Two dimensions, both extracted by the Research Agent
   (`rss_bronze`). **`rss_bronze` is raw and append-only** — no dedup
   logic at that layer, every feed entry lands exactly as received. A
   **silver table (`rss_silver`)** de-dupes on title+link (or a hash of
-  both) on top of bronze, since content overlaps heavily across clouds
-  when 2+ feeds are selected and a cross-cloud announcement should trigger
-  the Research Agent once, not multiple times. New-row arrival on
-  `rss_silver` (i.e. post-dedup) is the trigger for the Research Agent —
-  either a file/table-arrival-triggered Job, or a step in the same
-  Lakeflow Declarative Pipeline used for ingestion (Phase 2b below). This
+  both) **within a bounded time window keyed off each entry's `pubDate`**
+  — not an unbounded global keep-first, which would grow streaming dedup
+  state indefinitely over the feed's already-900+-item history (cross-
+  reviewed vs. `databricks-pipelines`' streaming-patterns guidance).
+  Duplicate title+link entries from a cross-cloud publish only ever arrive
+  close together in time, so a bounded window is sufficient. New-row
+  arrival on `rss_silver` (i.e. post-dedup) is the trigger for the
+  Research Agent, via a **file/table-arrival-triggered Job** — the sole
+  trigger mechanism (an LDP flow cannot itself invoke a Job or agent as a
+  side effect of a dataflow, only write to Streaming Tables/MVs/Sinks, so
+  the earlier "or a pipeline step fires it" option was incorrect and is
+  dropped; whether Jobs support a native table-arrival trigger type is
+  confirmed against `databricks-jobs` separately, see §6 #13). This
   replaces a polling watcher entirely if Zerobus → bronze is viable
   end-to-end; falls back to a scheduled poll of the selected feed(s) plus
   an `rss_seen` dedup table (playing the same role as `rss_silver`)
   otherwise.
+- **Zerobus fit, and the compute it runs on** (cross-reviewed vs.
+  `databricks-zerobus-ingest`): Zerobus's documented use cases are
+  continuous or app-embedded producers, not a periodic "fetch a feed every
+  N minutes, push maybe 0-5 new items" batch — using it here trades some
+  setup overhead (a dedicated publishing service principal with *explicit*
+  table-level `MODIFY`+`SELECT` grants on `rss_bronze`, not just
+  schema-level; a protobuf schema; and critically, **the Zerobus Python
+  SDK cannot run on serverless compute** — the RSS→Zerobus publisher Job
+  task must run on a classic-compute cluster, or use the Zerobus REST API
+  (Beta) instead if staying serverless matters more) for the benefit of
+  reusing one ingestion pattern consistently. `rss_bronze` itself must be
+  pre-created as a UC managed Delta table (Zerobus never creates/alters
+  tables). Not a blocker, but worth this explicit tradeoff note rather
+  than assuming Zerobus is free to adopt here.
 - **Research Agent** (one run per new `rss_silver` row): per the
   architecture diagram above. Key design points:
   - Always does a LIVE fetch of the announcement body + every link it
@@ -442,8 +465,14 @@ compliance standard. Two dimensions, both extracted by the Research Agent
 - A Lakeflow Declarative Pipeline (streaming, Autoloader) watches the JSON
   findings volume the Research Agent writes to and loads it: bronze (raw
   JSON) → silver (`research_log` Delta table, one row per skill
-  classification per RSS entry) → embeds the proposed-diff/summary text and
-  upserts the Vector Search index.
+  classification per RSS entry) → embeds the proposed-diff/summary text
+  and upserts the Vector Search index. **The embed+upsert step is a
+  `ForEachBatch Sink`** (Public Preview) with custom Python logic calling
+  the Vector Search index update API, not a plain Sink — Vector Search
+  isn't a natively-documented Sink target, and upsert semantics don't fit
+  a generic Sink's append-only framing (cross-reviewed vs.
+  `databricks-pipelines`). The plain Delta write to `research_log` stays a
+  normal streaming write, distinct from this custom sink step.
 - This keeps the Research Agent task itself simple and idempotent (just
   write a file); all the "land it in tables and make it searchable" logic
   lives in one reusable streaming pipeline instead of being duplicated
@@ -835,3 +864,13 @@ availability:                   # see §1b — cloud + region-scoped compliance 
     account-API check if those credentials happen to be configured,
     otherwise the user picks tracked region(s) explicitly at setup with no
     pre-filled default. Reflected in §1a and Phase 0 above.
+13. **Jobs' native table-arrival trigger support** (§2 Phase 2): the plan
+    now standardizes on a file/table-arrival-triggered Job as the sole
+    mechanism firing the Research Agent on new `rss_silver` rows (an LDP
+    flow can't do this itself — cross-review finding, see Phase 2). Needs
+    confirming against `databricks-jobs` specifically: does Databricks
+    Jobs actually support a native "new row/file arrival on a UC table"
+    trigger type today, and if not, what's the closest documented
+    equivalent (e.g. a `file_arrival` trigger scoped to a Volume path
+    rather than a table, or a scheduled Job short-polling `rss_silver`'s
+    version/commit timestamp)?
