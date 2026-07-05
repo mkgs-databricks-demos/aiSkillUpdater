@@ -444,6 +444,82 @@ no efficient single-row update.
   message — worth calling out explicitly in Phase 0's build tasks so it
   isn't a surprise.
 
+## 1d. Bundle deployment design (three bundles, dependency-ordered)
+
+**Repo owner preference, locked in as the deployment design**: this project
+ships as **three separate DABs**, not one, deployed in a strict dependency
+order. Each is its own `databricks.yml` (own directory, own bundle root),
+not three targets of a single bundle — because the ordering constraint is
+"fully deployed" gating, not just "deployed to a different workspace,"
+which is what DAB targets are for.
+
+- **`-infra`** — everything that must exist *before* the vector store or
+  the App can be deployed. This is the foundation layer: nothing in it
+  depends on data already being in Unity Catalog.
+  - UC catalog/schema, the docs-corpus and JSON-findings UC Volumes
+    (§ Phase 1, § Phase 2b)
+  - Secret scope for GitHub App credentials (§ Phase 0) — the scope
+    itself only; per §1a's provisioning flow, the actual credential
+    *values* are written at runtime by the App, never declared in bundle
+    YAML
+  - Lakebase database instance/project (and branch, if used for
+    dev/staging) backing §1c's OLTP state tables
+  - Service principals: the App's own, and any dedicated principal for
+    the RSS polling Job (§2 Phase 2) — created here so grants can target
+    them from resources deployed later
+  - Target table DDL: `rss_bronze` (§2's full `CREATE TABLE` — CDF, Row
+    Tracking, the `feed_value VARIANT` column, Variant Shredding,
+    `CLUSTER BY AUTO`), and any other raw landing tables
+  - The Lakeflow Declarative Pipelines that get data ready for use:
+    `rss_bronze` → `rss_silver` dedup (§2), and the findings-ingestion
+    pipeline through `research_log` (§ Phase 2b) — both produce the
+    Delta tables that `-ai-tools`'s Vector Search index syncs from, so
+    they must exist and have run at least once before that index is
+    created
+  - The RSS polling Job itself (§2) — it only ever writes to
+    `-infra`-owned tables, so it belongs here rather than in `-ai-tools`
+- **`-ai-tools`** — resources that need some `-infra` piece already
+  deployed (and, in most cases, populated) before they themselves can be
+  created. Deploying `-ai-tools` before `-infra` has run at least once is
+  expected to fail, not just be suboptimal.
+  - The Vector Search endpoint and both indexes (docs corpus, § Phase 1;
+    `research_log`, § Phase 2b) — both require their source Delta tables
+    to already exist in UC, per this project's existing DAB-bundling
+    finding that the index itself may not even be a declarable bundle
+    resource type (verify against current `databricks bundle schema`;
+    fall back to the already-planned idempotent post-deploy setup job if
+    not)
+  - Genie Spaces, if/when added (§ Phase 6 stretch) — same
+    data-must-exist-first constraint as Vector Search
+  - Any external MCP tools registered against Unity Catalog objects with
+    their own UC permissions/grants (§ Phase 6 stretch) — registration
+    requires the underlying UC objects (tables, the Vector Search index)
+    to already be present
+  - The CLI-drift-detection Job (§ Phase 4) is a judgment call: it reads
+    from Vector-Search-adjacent state but doesn't itself touch the index,
+    so it can live in `-ai-tools` for now since it's dependent on the
+    version-tracking Lakebase table (`-infra`) rather than on anything
+    `-ai-tools` itself creates — revisit if that changes
+- **`-app`** — the Databricks App resource itself (§ Phase 0, Phase 3,
+  Phase 5), plus the explicit post-`bundle deploy` "start the App" step
+  already noted below, since a bundle deploy alone can leave it stopped.
+  Deployed last because Phase 3's Review App reads `research_log`
+  (through the Vector Search index or a warehouse query) and Phase 5's
+  Local Installer both assume the earlier two bundles are fully live.
+- **Why three and not one**: a single bundle can't express "don't attempt
+  to create this Vector Search index until that Delta table has rows in
+  it" — DABs deploy declared resources, they don't sequence around
+  runtime data readiness. Three bundles deployed in order (`-infra` →
+  run the Job/pipelines at least once → `-ai-tools` → `-app`) makes that
+  ordering an operational script step instead of something the bundle
+  schema would have to (and can't) express. Each bundle is independently
+  re-deployable afterward — a Phase 7 alert fix only needs a fresh
+  `-infra` deploy, not a full three-bundle re-run.
+- Every earlier note in this doc that referred to "the DAB" (singular)
+  now refers to whichever of these three actually owns that resource —
+  see the per-phase bundling notes below (Phase 0/1/2b/3) for the
+  specific split.
+
 ## 2. Build phases
 
 ### Phase 0 — Workspace setup / repo configuration
@@ -505,7 +581,10 @@ no efficient single-row update.
   `app.yaml`, not in the bundle's `databricks.yml`, and a bundle deploy
   alone can leave the App resource stopped — deployment automation needs
   to explicitly run/start the App after `bundle deploy`, not assume it
-  starts itself.
+  starts itself. Per §1d: the secret scope, Lakebase instance, and
+  service principals this phase provisions belong to **`-infra`**; the
+  App resource itself (and this "start it after deploy" step) belongs to
+  **`-app`**, deployed last of the three.
 
 ### Phase 1 — Grounding corpus (docs ingestion)
 - Scrape/sync the relevant `docs.databricks.com` sections into a UC Volume,
@@ -531,6 +610,10 @@ no efficient single-row update.
   or incomplete, the DAB deploys the jobs/pipelines/app/volumes as usual,
   and a small **post-deploy setup job** creates or updates the Vector
   Search endpoint/index idempotently (safe to re-run on every deploy).
+  Per §1d: the UC Volumes and the pipelines/tables they feed belong to
+  **`-infra`**; the Vector Search endpoint/index (and its post-deploy
+  setup job, if needed) belongs to **`-ai-tools`**, deployed only after
+  `-infra` has run at least once so the source Delta tables have rows.
 
 ### Phase 2 — RSS ingestion + Research Agent (the event pipeline)
 - **RSS fetch is a scheduled Databricks Job, not the App** (investigated
@@ -935,7 +1018,7 @@ no efficient single-row update.
 | Per-installation OLTP state (Phase 0, Phase 3, §1c) | `databricks-lakebase` |
 | Review App | `databricks-apps`, `databricks-apps-python`, `databricks-app-design`, `databricks-lakebase` |
 | Knowledge base / MCP server | `databricks-vector-search`, `databricks-model-serving` (if fronting via an endpoint) |
-| Bundling everything | `databricks-dabs` (ship the deployable workspace resources as one bundle: jobs, Lakeflow Declarative Pipelines, the App, UC Volume/schema/table resources where the bundle schema supports them — not just "Job + App") |
+| Bundling everything | `databricks-dabs` (ship as **three** dependency-ordered bundles per §1d — `-infra`: schemas/volumes/secret scopes/Lakebase/service principals/target tables/pipelines/the RSS Job; `-ai-tools`: Vector Search endpoints/indexes, Genie Spaces, UC-registered MCP tools; `-app`: the App itself — not one "Job + App" bundle) |
 
 ## 4. Suggested build order
 
@@ -944,6 +1027,10 @@ no efficient single-row update.
    even developing against this repo should exercise the same
    configuration path (pointed at this repo) rather than hardcoding it, so
    Phase 0's plumbing is proven from day one instead of retrofitted later.
+   This is also where the three-bundle deploy order (§1d) first gets
+   exercised for real: `-infra` deploys and its Job/pipelines run at
+   least once, *then* `-ai-tools`, *then* `-app` — proving the sequencing
+   script itself, not just each bundle's YAML in isolation.
 1. Phase 2 (RSS watcher + Research Agent), run manually against one
    real RSS entry end-to-end, to prove the fetch → summarize → cite →
    classify → propose loop works before investing in a UI.
