@@ -238,9 +238,10 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   repo connection above): the user chooses which of the three Release
   Notes feeds (§6 #6 — AWS/GCP/Azure) this installation ingests, any
   combination including all three, defaulting to **the cloud this
-  installation is deployed on** (auto-detected — mechanism TBD, see §6 new
-  open question). Changeable later in settings, same as the repo
-  connection. This is the one piece of Phase 0 config that DOES reach into
+  installation is deployed on** (auto-detected via
+  `WorkspaceClient().config.cloud` — resolved, see §6 #10). Changeable
+  later in settings, same as the repo connection. This is the one piece of
+  Phase 0 config that DOES reach into
   the RSS/Research Agent pipeline (§1, Phase 2) — everything else there
   remains workspace infra untouched by which skills repo is configured.
 - This has no effect on Phase 4's CLI-drift logic (still comparing against
@@ -710,11 +711,22 @@ availability:                   # see §1b — cloud + compliance-level support,
    current source content and feeds the result into the same review queue
    as RSS-driven proposals, with the same accept/reject/edit-then-accept
    options. Reflected in §1a and Phase 3 above.
-10. **Auto-detecting the deployment cloud** (§1a, §6 #6): what's the most
-    reliable way for code running inside a Databricks App to determine
-    whether it's deployed on AWS, Azure, or GCP, to use as the default
-    cloud-tracking selection? Dispatched for investigation
-    (`explore-detect-workspace-cloud-provider`); pending result.
+10. ~~Auto-detecting the deployment cloud~~ — **Resolved.** Use the
+    Databricks Python SDK: `WorkspaceClient().config.cloud` (falling back
+    to `.config.environment.cloud`), which returns `"AWS"`, `"AZURE"`, or
+    `"GCP"` directly — no REST call or account-level credentials needed.
+    Databricks Apps automatically get `DATABRICKS_HOST` + service-principal
+    credentials in their environment, so this works out of the box for a
+    Databricks App (confirmed: Apps don't get a default `DATABRICKS_CLOUD`
+    env var, but the SDK's `config.cloud` resolves it anyway). Fallback if
+    ever needed without the SDK: infer from the `DATABRICKS_HOST` hostname
+    suffix (`*.azuredatabricks.net`/`.databricks.azure.us`/`.azure.cn` →
+    Azure; `*.gcp.databricks.com` → GCP; `*.cloud.databricks.com`/
+    `.cloud.databricks.us` → AWS). Avoid the Account Workspaces API (needs
+    account-level creds, not appropriate from inside an app) and avoid
+    `dbutils`/Spark-internal config (Apps aren't a notebook Spark driver by
+    default). This is Phase 0's concrete mechanism for the cloud-tracking
+    default in §1a.
 11. **Compliance-availability docs source** (§1b): does Databricks publish
     a structured per-feature compliance-profile (HIPAA/PCI-DSS/FedRAMP
     Moderate) support matrix, or is this only ever documented ad hoc/prose
