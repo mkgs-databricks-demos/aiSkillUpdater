@@ -595,6 +595,41 @@ no efficient single-row update.
     processed/seen marker, optionally via Delta Change Data Feed on
     `rss_silver` if efficient row-level change extraction is needed, rather
     than assuming "one trigger fire = one new row."
+- **`rss_bronze`'s table design** — a plain UC managed Delta table (not a
+  Lakeflow Declarative Pipeline STREAMING TABLE — DLT-managed table
+  properties for these specific features aren't documented, and a plain
+  managed table has no such gap), created once with every feature this
+  project's storage design calls for set together at creation time:
+  ```sql
+  CREATE TABLE main.<schema>.rss_bronze (
+    feed_cloud STRING,
+    guid       STRING,
+    fetched_at TIMESTAMP,
+    feed_value VARIANT          -- raw <item> as parsed JSON
+  )
+  CLUSTER BY AUTO
+  TBLPROPERTIES (
+    delta.enableChangeDataFeed   = true,
+    delta.enableRowTracking      = true,
+    delta.enableVariantShredding = true
+  );
+  ```
+  CDF, Row Tracking, a `VARIANT` column, and `CLUSTER BY AUTO` are all
+  confirmed compatible together on one table (no documented conflict);
+  Variant Shredding is Beta and needs a DBR floor + a workspace-admin
+  Previews toggle enabled once per installation. **Assumption locked for
+  this plan**: Variant Shredding is treated as available identically
+  whether the table is written by a plain Job task (as `rss_bronze` is)
+  or produced/consumed by a Spark Declarative Pipeline (as `rss_silver`
+  and the findings-ingestion pipeline are, per Phase 2b) — i.e. these are
+  full Delta table properties, not something gated by which engine wrote
+  the table. This is taken as given rather than re-investigated; if a
+  concrete DBR version pins this differently for pipeline-managed tables
+  specifically, revisit then, not before.
+  `rss_silver`'s Lakeflow Declarative Pipeline then reads `rss_bronze` via
+  `STREAM(rss_bronze)` for its dedup transform — this is the actual
+  streaming-table consumer in this design; `rss_bronze` itself only ever
+  needs batch-append writes, never DLT-managed writes.
 - **The daily polling notebook task**, in full (single Job task, runs
   once a day on serverless compute — no continuous producer, no gRPC
   stream, no dedicated publishing service principal needed since it's
@@ -621,9 +656,9 @@ no efficient single-row update.
      Spark directly) from the parsed items and write it with
      `.write.format("delta").mode("append")` straight to `rss_bronze` —
      one plain batch write per run, not a per-item streaming call.
-     `rss_bronze` must already exist as a UC managed Delta table (created
-     once, by the DAB or a setup step) with a schema matching these
-     fields plus the feed/cloud/run-timestamp stamps from step 3.
+     `rss_bronze` must already exist with the schema + `TBLPROPERTIES`
+     given above (created once, by the DAB or a setup step) — the raw
+     item JSON lands in the `feed_value` VARIANT column as-is.
   5. **Save the cursor.** Whether this feed returned `200` (new
      `ETag`/`Last-Modified`) or `304` (headers unchanged, but still worth
      refreshing the "last checked" timestamp for observability), upsert
