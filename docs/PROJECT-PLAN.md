@@ -157,10 +157,10 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
 
 - **Setup step, once per installation**: during first-run/onboarding, the
   App asks the user (or workspace admin) to connect a GitHub repo — owner +
-  repo name, plus credentials (see open question in §6 on OAuth App vs. a
-  PAT stored as a Databricks secret vs. a GitHub App installation). That
-  repo becomes the single target this installation reads skills from and
-  opens PRs against for the lifetime of the install (changeable later in
+  repo name, plus credentials via a **GitHub App connection** (resolved —
+  see the provisioning flow below and §6 open question #8). That repo
+  becomes the single target this installation reads skills from and opens
+  PRs against for the lifetime of the install (changeable later in
   settings, but not silently).
 - **Starting point options at setup**, since a brand-new repo is empty:
   1. **Start from scratch** — the user's repo stays empty until the first
@@ -174,6 +174,45 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   - Either way, after setup the installation is fully independent — it
     reads/writes only its own configured repo from then on. A starter pack
     is a one-time seed, not an ongoing dependency.
+- **GitHub connection mechanism: GitHub App, fully provisioned from inside
+  the Databricks App's own UI** (resolves §6 open question #8). Two
+  distinct provisioning steps, both driven by a button-click-and-redirect
+  in the App — no manual GitHub settings-page form-filling, no hand-copied
+  client secrets or private keys, no CLI steps outside the App:
+  1. **One-time: register the GitHub App itself** (per deployment of this
+     project, not per end user). An admin setup screen in the App uses
+     GitHub's **App Manifest flow**: the App generates a manifest (name,
+     permissions — `contents:write`, `pull_requests:write` on the target
+     repo(s) — and its own callback URL), the admin clicks through to
+     GitHub to confirm/name the app, and GitHub redirects back with a
+     temporary code. The App exchanges that code server-side for the full
+     credential set (app ID, private key (PEM), webhook secret, client
+     ID/secret) and stores them as Databricks secrets. The admin never
+     manually fills in a GitHub App settings form or copy-pastes a private
+     key.
+  2. **Per-installation: connect a repo**. From the per-workspace setup
+     screen (this section), the user clicks "Connect GitHub repo," which
+     redirects to GitHub's own **App installation** picker (scoped to
+     choosing an org/repo to install the app on) and back to the App with
+     an `installation_id`. The App stores that ID against this
+     installation's config (a small state table, not a secret — the ID
+     alone isn't a credential) and mints short-lived **installation access
+     tokens** on-demand server-side whenever it needs to commit or open a
+     PR. No PAT, and no long-lived credential the user has to generate or
+     paste themselves.
+  - **Honest caveat**: GitHub requires the human's consent click to happen
+     on `github.com` itself for both flows (the manifest confirm screen,
+     and the install-picker) — that's an unavoidable, by-design part of
+     how GitHub Apps work, not something this project can eliminate. The
+     part that stays entirely inside the Databricks App's UI is
+     everything else: no manual form-filling, no copying credentials by
+     hand, no separate CLI or GitHub-settings-page workflow — just
+     click-redirect-confirm-return.
+  - This adds real Phase 0 implementation surface: two callback endpoints
+     in the App backend (manifest-creation callback, installation
+     callback), secret storage for the app-level credentials, and a small
+     per-installation state table for `installation_id` → workspace repo
+     config. Sized accordingly when Phase 0 gets scoped for build.
 - **Resolved — starter packs stay live reference sources, not just a
   one-time seed**: after setup, a user can hit a **"Check for latest from
   Matt's version"** action (Skill Library browser, per-skill or a full
@@ -193,11 +232,22 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
 ## 2. Build phases
 
 ### Phase 0 — Workspace setup / repo configuration
-- First-run onboarding flow per §1a: connect a GitHub repo (auth mechanism
-  TBD, see §6), choose "start from scratch" vs. "seed from a starter pack"
-  (with "Matt's version" as the first available pack), and store the
-  resolved repo + credentials as the installation's configuration (a
-  Databricks App resource + secret, most likely).
+- First-run onboarding flow per §1a: connect a GitHub repo via a **GitHub
+  App**, choose "start from scratch" vs. "seed from a starter pack" (with
+  "Matt's version" as the first available pack), and store the resolved
+  repo + installation config.
+- Two-part GitHub App provisioning (resolved, §1a and §6 #8), both build
+  tasks for this phase:
+  1. **App-level, one-time**: an admin setup screen implementing GitHub's
+     App Manifest flow (generate manifest → redirect to GitHub to confirm
+     → callback exchanges the temporary code for app ID, private key,
+     webhook secret, client ID/secret → store as Databricks secrets). Only
+     run once per deployment of this project, not per installation.
+  2. **Per-installation**: a "Connect GitHub repo" button that redirects to
+     GitHub's App installation picker and back with an `installation_id`,
+     stored in a small per-installation state table. Installation access
+     tokens are minted on-demand server-side from then on — no PAT ever
+     stored or handled.
 - Blocks every later phase that reads or writes skill files, so needs to
   exist before Phase 3 (Review App accept flow) or Phase 5 (Local
   Installer) can be exercised against anything other than this original
@@ -519,21 +569,19 @@ last_research_log_id: "rl_00042"
    supported agent set (Claude Code, Cursor, Codex CLI, OpenCode, GitHub
    Copilot, Antigravity). Pi is out of scope until there's a reason to
    revisit it — no invented convention needed today.
-8. **GitHub connection mechanism for §1a**: how should a workspace connect
-   its chosen GitHub repo? Options, roughly in order of setup friction vs.
-   security posture:
-   - **PAT stored as a Databricks secret** — simplest to build (Phase 0
-     MVP candidate), but a fine-grained PAT scoped to one repo is still a
-     manually-rotated credential the user has to generate themselves.
-   - **GitHub App installation** — better security posture (repo-scoped
-     installation token, no long-lived PAT, revocable from GitHub's side),
-     but requires registering and maintaining a GitHub App, which is more
-     upfront work than a secret field.
-   - **User's own GitHub OAuth token** (App acts as the logged-in user) —
-     avoids the app needing its own GitHub App registration, but ties repo
-     access to a specific human's account rather than the installation
-     itself.
-   No decision yet — needs the repo owner's input before Phase 0 is built.
+8. ~~GitHub connection mechanism for §1a~~ — **Resolved: GitHub App**,
+   fully provisioned through the Databricks App's own UI — no manual
+   GitHub settings-page form-filling, no hand-copied client secrets or
+   private keys, no separate CLI steps. Concretely: a one-time admin setup
+   screen drives GitHub's App Manifest flow to register the app itself and
+   store its credentials as Databricks secrets; a per-installation "Connect
+   GitHub repo" button drives GitHub's App installation picker and stores
+   the resulting `installation_id`. Installation access tokens are minted
+   on-demand server-side after that — no PAT is ever generated or handled
+   by a user. The one unavoidable exception: GitHub requires the human's
+   consent click to land on `github.com` itself for both flows (by design,
+   not something an embedding app can remove) — everything else stays
+   inside the Databricks App. Reflected in §1a and Phase 0 above.
 9. ~~Starter pack as ongoing reference, not just one-time seed~~ —
    **Resolved**: yes — a starter pack stays a live, on-demand reference
    source. The user can trigger "check for latest from `<starter pack>`"
