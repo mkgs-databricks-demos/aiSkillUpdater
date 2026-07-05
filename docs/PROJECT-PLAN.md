@@ -91,8 +91,9 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 ┌───────────────────────────────────────────────────────────────────┐
 │ Ingestion Pipeline (Lakeflow Declarative Pipeline, streaming)       │
 │  - Autoloader watches the JSON findings volume → bronze → silver     │
-│    (`research_log` Delta table) → embeds proposed-diff text and       │
-│    updates the Vector Search index                                    │
+│    (`research_log` Delta table); a Delta Sync Vector Search index     │
+│    (managed embeddings, TRIGGERED) syncs from `research_log` — the    │
+│    pipeline never manually upserts the index                          │
 │  - Decouples "agent writes a file" from "data lands in queryable      │
 │    tables + search index", so the Research Agent task stays simple    │
 │    and idempotent (just write a JSON file)                            │
@@ -390,6 +391,23 @@ compliance standard. Two dimensions, both extracted by the Research Agent
      stored in a small per-installation state table. Installation access
      tokens are minted on-demand server-side from then on — no PAT ever
      stored or handled.
+- **Two Databricks Apps platform constraints confirmed by cross-review**
+  (vs. `databricks-apps`/`databricks-apps-python`) that both build tasks
+  above need to account for:
+  - GitHub's redirect/callback URLs must be registered against the
+    deployed App's **public `*.databricksapps.com` host** (Azure:
+    `*.azure.databricksapps.com`) — obtained only after first deploy, not
+    the workspace URL. Custom `GET` callback routes themselves are
+    supported (via AppKit's `server.extend()`/`onPluginsReady`, or the
+    chosen Python framework's router) — the routing capability itself was
+    confirmed, just the exact host to register.
+  - The manifest callback **writes** the app-level credentials to a
+    secret scope at runtime — the App's service principal needs **CAN
+    WRITE/MANAGE** on that scope, not the platform's default READ-only
+    declared permission, so this must be explicitly elevated. Also: the
+    App's filesystem is ephemeral, so nothing (including these
+    credentials) can be cached to local disk between restarts — always
+    read from the secret scope.
 - Blocks every later phase that reads or writes skill files, so needs to
   exist before Phase 3 (Review App accept flow) or Phase 5 (Local
   Installer) can be exercised against anything other than this original
@@ -398,8 +416,13 @@ compliance standard. Two dimensions, both extracted by the Research Agent
 
 ### Phase 1 — Grounding corpus (docs ingestion)
 - Scrape/sync the relevant `docs.databricks.com` sections into a UC Volume,
-  chunk + embed into a Vector Search index (reuses `databricks-vector-search`
-  patterns already staged in this repo).
+  chunk + embed into a **Delta Sync index with managed embeddings**
+  (reuses `databricks-vector-search` patterns already staged in this
+  repo). Pin the embedding endpoint to whatever's current per that skill
+  at build time (e.g. `databricks-qwen3-embedding-0-6b` as of this
+  writing) rather than a hardcoded/legacy model name — cross-reviewed
+  against the vector-search skill, which has moved on from its older
+  GTE/BGE examples.
 - This corpus is *supplementary* context, not the primary source for a given
   announcement — the Research Agent always does a live fetch of the
   announcement's own links first (Phase 2). This corpus just gives it
@@ -591,6 +614,17 @@ compliance standard. Two dimensions, both extracted by the Research Agent
   the App, and (b) a Databricks App-hosted MCP server so other agents can
   query it programmatically (e.g. "what's the latest guidance on X",
   "which skill covers Y").
+- **Two separate indexes is deliberate, not an oversight** (cross-reviewed
+  vs. `databricks-vector-search`): the Phase 1 docs-corpus index and the
+  Phase 2b `research_log` index have different source Delta tables,
+  different schemas/`columns_to_sync`, and different refresh cadences
+  (periodic vs. per-announcement) — a Delta Sync index maps 1:1 to one
+  source table, so merging them isn't the right move. Both can share one
+  Storage-Optimized Vector Search endpoint to avoid provisioning two.
+- Default `research_log` search/MCP queries to **HYBRID** (semantic +
+  keyword/BM25), not pure ANN — these queries frequently contain exact
+  skill names, feature names, and compliance terms (HIPAA, PCI-DSS, etc.)
+  that need literal matching alongside semantic recall.
 - This is additive — build after Phases 1–5 are solid, since it's a new
   consumer of the same data rather than a dependency of the core loop.
 
