@@ -284,11 +284,42 @@ compliance standard. Two dimensions, both extracted by the Research Agent
   `unknown` (not just `true`/`false`) matters here: the Research Agent
   should never assert compliance availability it didn't actually find
   evidence for — absence of a mention is not evidence of unavailability.
-- **Extraction mechanism**: `ai_extract` (not `ai_classify`, which is
-  already used for skill routing §1 step 4) against the fetched
-  announcement + linked docs, per skill/feature. Depends on the docs-source
-  investigation in §6 to know what to point it at and how reliably
-  compliance info is actually documented per-feature.
+- **Extraction mechanism (resolved, §6 #11)**: Databricks publishes
+  structured, scrapable **"Regional support for features" HTML tables**,
+  one per compliance standard (Feature × Region grid) — not a JSON/API
+  feed, but consistent server-rendered `<table>` markup on fixed URLs:
+  - HIPAA: `docs.databricks.com/aws/en/security/privacy/hipaa`
+  - PCI-DSS: `docs.databricks.com/aws/en/security/privacy/pci`
+  - FedRAMP Moderate: `docs.databricks.com/aws/en/security/privacy/fedramp`
+    (**AWS-only** — no FedRAMP page/authorization exists for GCP or Azure;
+    `fedramp_moderate` should only ever be assessed for AWS-hosted
+    workspaces, always `false`/n\a otherwise, never `unknown`)
+  - Plus a cross-feature preview/beta support table on the main CSP page
+    (`docs.databricks.com/aws/en/security/privacy/security-profile`) for
+    features still in preview.
+  These three standard pages are the **primary, most authoritative
+  source** — `ai_extract` (or plain table-parsing, arguably more reliable
+  than an LLM call for a fixed HTML table) reads a feature's row across
+  all three pages. This is a **periodic reference fetch**, not something
+  tied to a specific RSS announcement's linked URLs — the Research Agent
+  should check these three fixed pages for the classified feature
+  regardless of what the announcement itself links to. Individual
+  feature/release-notes pages *sometimes* also carry their own compliance
+  notes (e.g. the Model Serving limits page has its own region × standard
+  table), but coverage there is inconsistent/ad hoc — useful as a
+  secondary confirmation when an announcement happens to link to one, not
+  something to rely on as a primary source.
+  - **Nuance not captured by the proposed boolean/`unknown` frontmatter
+    (§1b)**: these tables are actually **Feature × Region** within a given
+    standard (e.g. FedRAMP Moderate only covers 4 specific `us-*` AWS
+    regions; PCI-DSS covers 16). A skill saying `pci_dss: true` is
+    slightly lossy versus "true, in these specific regions." Acceptable
+    simplification for MVP (a coding skill doesn't usually need
+    region-level granularity), but worth a note in the skill's rendered
+    body text even if the frontmatter itself stays boolean.
+  - The FedRAMP Moderate page itself warns features may be listed as
+    available before they're actually released — treat as directional,
+    not a hard guarantee, and say so in any skill content that cites it.
 - **Not a one-time concern**: like Phase 4's CLI-drift check, compliance/
   cloud availability can change independent of a new RSS announcement
   (e.g. FedRAMP authorization catching up later for an already-GA
@@ -727,9 +758,15 @@ availability:                   # see §1b — cloud + compliance-level support,
     `dbutils`/Spark-internal config (Apps aren't a notebook Spark driver by
     default). This is Phase 0's concrete mechanism for the cloud-tracking
     default in §1a.
-11. **Compliance-availability docs source** (§1b): does Databricks publish
-    a structured per-feature compliance-profile (HIPAA/PCI-DSS/FedRAMP
-    Moderate) support matrix, or is this only ever documented ad hoc/prose
-    per feature page, requiring `ai_extract` to read it out per-feature
-    with no structured source to lean on? Dispatched for investigation
-    (`databricks-compliance-availability-docs`); pending result.
+11. ~~Compliance-availability docs source~~ — **Resolved.** Yes — better
+    than expected: Databricks publishes a structured **"Regional support
+    for features" HTML table per compliance standard** (Feature × Region
+    grid) on each standard's own docs page (HIPAA, PCI-DSS, FedRAMP
+    Moderate, plus IRAP/HITRUST/ISMAP/TISAX/C5/K-FSI), and a cross-feature
+    preview/beta support table on the main CSP page. Server-rendered HTML,
+    not a JSON/API feed, but consistent and scrapable. Confirmed **FedRAMP
+    is AWS-only** (no GCP/Azure FedRAMP page exists). Individual
+    feature/release-notes pages sometimes carry their own compliance notes
+    too, but that coverage is inconsistent — the three standard pages are
+    the authoritative primary source. Exact URLs and the extraction
+    approach are now in §1b above.
