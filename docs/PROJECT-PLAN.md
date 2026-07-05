@@ -101,6 +101,9 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │   - Search/browse all skills + their version history                    │
 │   - Compare: user's maintained version vs. CLI-bundled version vs.      │
 │     latest research-proposed version, three-way                         │
+│   - "Check for latest from <starter pack>" (per-skill or full sweep) →  │
+│     diffs against the pack's source repo, feeds result(s) into the       │
+│     SAME review queue above for accept/reject/edit-then-accept (§1a)     │
 │  CLI-drift check (on new CLI release, see §2 Phase 4):                  │
 │   - Table: skill, user's base_cli_version, user's current version,      │
 │     CLI's shipped version in the new release, verdict                   │
@@ -171,10 +174,16 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   - Either way, after setup the installation is fully independent — it
     reads/writes only its own configured repo from then on. A starter pack
     is a one-time seed, not an ongoing dependency.
-- **Open design question**: should a starter pack *also* be usable later as
-  an ongoing **reference source** — e.g. "diff my `databricks-jobs` skill
-  against Matt's current version" as a manual action in the Skill Library
-  browser — separate from the one-time seed at setup? Tracked in §6.
+- **Resolved — starter packs stay live reference sources, not just a
+  one-time seed**: after setup, a user can hit a **"Check for latest from
+  Matt's version"** action (Skill Library browser, per-skill or a full
+  sweep) that diffs their current skill(s) against the pack source repo's
+  current content and produces the same **accept/reject/edit-then-accept**
+  review flow already used for RSS-driven proposals (Phase 3) — reusing
+  that review queue rather than inventing a second one. This means Phase
+  0's pack registry must persist a live `source repo + ref` per
+  installation (not just perform a point-in-time copy at setup), so it can
+  be re-diffed on demand.
 - This has no effect on Phase 4's CLI-drift logic (still comparing against
   the public `databricks-agent-skills` repo, independent of which skills
   repo this installation is configured to use) or on the RSS/Research
@@ -262,6 +271,13 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   the label the human actually confirmed, not the model's first guess. A
   new bucket the user creates becomes a permanent taxonomy entry (and,
   eventually, a new skill directory) for future classification runs.
+- **Starter-pack check (§1a)**: the same review queue also accepts entries
+  from an on-demand "check for latest from `<starter pack>`" action (not
+  just RSS-driven proposals) — a per-skill or full-sweep diff against the
+  pack's source repo, reviewed and accepted/rejected exactly like a
+  research-generated proposal. No separate UI needed; it's the same queue,
+  same diff view, same edit-then-accept path, just a different origin for
+  the proposed content.
 
 ### Phase 4 — Version tracking + CLI-drift detection
 - **Versioning scheme** (see §5 for the concrete format): every skill file
@@ -518,10 +534,10 @@ last_research_log_id: "rl_00042"
      access to a specific human's account rather than the installation
      itself.
    No decision yet — needs the repo owner's input before Phase 0 is built.
-9. **Starter pack as ongoing reference, not just one-time seed**: should
-   "Matt's version" (or any starter pack) remain queryable later — e.g. a
-   "compare my `X` skill to Matt's current version" action in the Skill
-   Library browser (§1, App box) — or is it purely a one-time seed at
-   setup with no ongoing relationship to the source repo afterward? Affects
-   whether Phase 0's pack registry needs to persist a live reference (repo
-   + ref, periodically refreshed) or just a point-in-time copy operation.
+9. ~~Starter pack as ongoing reference, not just one-time seed~~ —
+   **Resolved**: yes — a starter pack stays a live, on-demand reference
+   source. The user can trigger "check for latest from `<starter pack>`"
+   (per-skill or full sweep) at any time, which diffs against the pack's
+   current source content and feeds the result into the same review queue
+   as RSS-driven proposals, with the same accept/reject/edit-then-accept
+   options. Reflected in §1a and Phase 3 above.
