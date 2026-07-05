@@ -250,11 +250,19 @@ access to `mkgs-databricks-demos/aiSkillUpdater`.
   within their selected cloud(s), they actually care about** for
   feature-availability tracking — not "all regions everywhere," which
   would bloat every skill's availability data with regions the user will
-  never deploy to. Defaults to **this installation's own deployment
-  region**, auto-detected (mechanism: see new open question — dispatched
-  for investigation, `detect-workspace-region`). Multi-select supported
-  (a user managing workloads in two AWS regions can track both).
-  Changeable later in settings, same as cloud selection.
+  never deploy to. **Default resolution (§6 #12): no reliable universal
+  auto-detection exists** — unlike cloud (§6 #10), the Databricks SDK
+  exposes no workspace-scoped region field; the only authoritative source
+  is the account-level Workspaces API (AWS/GCP) or Azure Resource
+  Manager, both of which need account/management-plane credentials a
+  Databricks App doesn't have by default. So: **best-effort** — try the
+  account API if the installation happens to have those credentials
+  configured (unlikely for most installs); otherwise **prompt the user
+  to pick their region(s) explicitly at setup**, with no pre-filled
+  default, rather than guessing from the workspace hostname (explicitly
+  unreliable for modern workspace URLs, confirmed by investigation).
+  Multi-select supported (a user managing workloads in two AWS regions
+  can track both). Changeable later in settings, same as cloud selection.
 - These two selections (cloud + region) are the pieces of Phase 0 config
   that reach into the RSS/Research Agent pipeline (§1, Phase 2) and the
   availability model (§1b) — everything else there
@@ -364,9 +372,10 @@ compliance standard. Two dimensions, both extracted by the Research Agent
 ### Phase 0 — Workspace setup / repo configuration
 - First-run onboarding flow per §1a: connect a GitHub repo via a **GitHub
   App**, choose "start from scratch" vs. "seed from a starter pack" (with
-  "Matt's version" as the first available pack), pick tracked cloud(s) +
-  region(s) (§1a, defaulting to this installation's deployment cloud +
-  region), and store the resolved repo + installation config.
+  "Matt's version" as the first available pack), pick tracked cloud(s)
+  (§1a, defaulting to this installation's auto-detected deployment cloud)
+  + tracked region(s) (§1a, §6 #12 — no reliable auto-default, user picks
+  explicitly), and store the resolved repo + installation config.
 - Two-part GitHub App provisioning (resolved, §1a and §6 #8), both build
   tasks for this phase:
   1. **App-level, one-time**: an admin setup screen implementing GitHub's
@@ -812,9 +821,17 @@ availability:                   # see §1b — cloud + region-scoped compliance 
     too, but that coverage is inconsistent — the three standard pages are
     the authoritative primary source. Exact URLs and the extraction
     approach are now in §1b above.
-12. **Auto-detecting the deployment region** (§1a): what's the most
-    reliable way for code running inside a Databricks App to determine
-    which specific region (e.g. `us-west-2`, `eastus2`) the workspace is
-    deployed in, to use as the default tracked-region selection alongside
-    §6 #10's cloud detection? Dispatched for investigation
-    (`detect-workspace-region`); pending result.
+12. ~~Auto-detecting the deployment region~~ — **Resolved: no reliable
+    universal method exists**, unlike cloud (#10). The Databricks SDK's
+    `WorkspaceClient` exposes no workspace-scoped region field; the only
+    authoritative programmatic source is the **account-level** Workspaces
+    API (AWS: `aws_region`; GCP: `location`) or Azure Resource Manager's
+    `Microsoft.Databricks/workspaces` `location` field — both need
+    account/management-plane credentials a Databricks App doesn't get by
+    default. Hostname inference is explicitly unreliable for modern
+    per-workspace URLs (confirmed — legacy region-encoded hostnames still
+    exist but Databricks itself advises against relying on them). No
+    default env var is exposed to Apps either. **Decision**: best-effort
+    account-API check if those credentials happen to be configured,
+    otherwise the user picks tracked region(s) explicitly at setup with no
+    pre-filled default. Reflected in §1a and Phase 0 above.
