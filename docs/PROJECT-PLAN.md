@@ -47,10 +47,10 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │    window keyed off pubDate (bounded state, not a global keep-first)  │
 │    so a cross-cloud announcement (2-3 clouds selected) doesn't        │
 │    trigger the pipeline more than once                                │
-│  - Arrival of a new `rss_silver` row is the trigger, via a            │
-│    file/table-arrival-triggered Job run (the sole mechanism — an LDP  │
-│    flow cannot itself invoke a Job/agent as a side effect, only write │
-│    to Streaming Tables/MVs/Sinks; cross-reviewed vs. §6 #13)          │
+│  - Arrival of a new `rss_silver` row is the trigger, via a Databricks │
+│    Jobs **Table update** trigger on `rss_silver` (`trigger.table_update`, │
+│    `condition: ANY_UPDATED`) — resolved §6 #13; not `file_arrival`,     │
+│    which only covers Volumes/external locations, not managed tables      │
 │  - Falls back to a scheduled poll of the selected feed(s) only if    │
 │    Zerobus ingestion isn't available end-to-end (see open question   │
 │    below)                                                              │
@@ -536,12 +536,22 @@ no efficient single-row update.
   Duplicate title+link entries from a cross-cloud publish only ever arrive
   close together in time, so a bounded window is sufficient. New-row
   arrival on `rss_silver` (i.e. post-dedup) is the trigger for the
-  Research Agent, via a **file/table-arrival-triggered Job** — the sole
-  trigger mechanism (an LDP flow cannot itself invoke a Job or agent as a
-  side effect of a dataflow, only write to Streaming Tables/MVs/Sinks, so
-  the earlier "or a pipeline step fires it" option was incorrect and is
-  dropped; whether Jobs support a native table-arrival trigger type is
-  confirmed against `databricks-jobs` separately, see §6 #13). This
+  Research Agent, via a Databricks Jobs **Table update** trigger
+  (`trigger.table_update`, `table_names: ["<catalog>.<schema>.rss_silver"]`,
+  `condition: ANY_UPDATED`) — resolved §6 #13, confirmed against
+  `databricks-jobs`. This is a real, UC-table-scoped native trigger type
+  (distinct from `file_arrival`, which only covers Volumes/external
+  locations, never managed tables), and is the sole trigger mechanism (an
+  LDP flow cannot itself invoke a Job or agent as a side effect of a
+  dataflow, only write to Streaming Tables/MVs/Sinks, so the earlier "or a
+  pipeline step fires it" option was correctly dropped). **Important
+  caveat**: the trigger fires on table **commit**, not per row — the
+  Research Agent's Job must enumerate the actually-new rows itself using
+  the trigger's exposed commit version/timestamp
+  (`{{job.trigger.table_update...}}`) against an idempotent
+  processed/seen marker, optionally via Delta Change Data Feed on
+  `rss_silver` if efficient row-level change extraction is needed, rather
+  than assuming "one trigger fire = one new row." This
   replaces a polling watcher entirely if Zerobus → bronze is viable
   end-to-end; falls back to a scheduled poll of the selected feed(s) plus
   an `rss_seen` dedup table (playing the same role as `rss_silver`)
@@ -1040,13 +1050,19 @@ availability:                   # see §1b — cloud + region-scoped compliance 
     account-API check if those credentials happen to be configured,
     otherwise the user picks tracked region(s) explicitly at setup with no
     pre-filled default. Reflected in §1a and Phase 0 above.
-13. **Jobs' native table-arrival trigger support** (§2 Phase 2): the plan
-    now standardizes on a file/table-arrival-triggered Job as the sole
-    mechanism firing the Research Agent on new `rss_silver` rows (an LDP
-    flow can't do this itself — cross-review finding, see Phase 2). Needs
-    confirming against `databricks-jobs` specifically: does Databricks
-    Jobs actually support a native "new row/file arrival on a UC table"
-    trigger type today, and if not, what's the closest documented
-    equivalent (e.g. a `file_arrival` trigger scoped to a Volume path
-    rather than a table, or a scheduled Job short-polling `rss_silver`'s
-    version/commit timestamp)?
+13. ~~Jobs' native table-arrival trigger support~~ — **Resolved.** Yes —
+    Databricks Jobs has a native **Table update** trigger
+    (`trigger.table_update`) scoped to UC managed Delta/Iceberg tables
+    (also materialized views, streaming tables, some UC views), configured
+    with `table_names` + `condition: ANY_UPDATED`/`ALL_UPDATED` and
+    optional debounce (`min_time_between_triggers_seconds`,
+    `wait_after_last_change_seconds`). This is a genuinely different
+    trigger from `file_arrival`, which is scoped only to UC external
+    locations/Volumes and explicitly excludes managed tables — the plan's
+    earlier "file/table-arrival" phrasing conflated the two. One real
+    constraint to design around: the trigger fires on table **commit**,
+    not per new row, so the Research Agent's Job must still enumerate
+    which rows are actually new via the trigger's exposed commit
+    version/timestamp against an idempotent processed-marker (optionally
+    using Delta Change Data Feed for efficient row-level extraction).
+    Reflected in §1/Phase 2 above.
