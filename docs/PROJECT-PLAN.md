@@ -7,6 +7,11 @@ feed, researches each announcement, drafts skill updates, and lets a human
 review + apply them to their local coding-agent skill directories — with a
 human approval gate before anything ships.
 
+**Distributable, not single-tenant:** this app is meant to be installable by
+other people into their own Databricks workspaces, not just run against
+*this* repo. Each installation configures its own GitHub repo as the place
+it reads from and opens PRs against — see §1a.
+
 ## 0. Current state (baseline)
 
 - This repo is the staging area: one directory per skill, each with an
@@ -88,7 +93,7 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │   - Full markdown viewer + editor for any skill file (view current,   │
 │     view proposed, edit either, save)                                  │
 │  On accept:                                                            │
-│   - Writes the approved version into this repo's skill directory        │
+│   - Writes the approved version into the configured skills repo (§1a)   │
 │     (commit + PR, never direct-to-main — same as before) AND/OR         │
 │   - Offers "Apply locally now" → runs the Local Installer (§4) against  │
 │     the machine the App can reach (see open question in §6)             │
@@ -104,16 +109,18 @@ locally-applied" — the human review step stays, it just gets a proper UI.
                               ▼ (only on explicit user action)
 ┌───────────────────────────────────────────────────────────────────┐
 │ Local Installer — git-based (primary) + downloadable script (fallback) │
-│  - Primary: this repo's PR (already produced by Phase 3's accept flow)  │
-│    is the trust boundary. User runs `git pull` + a small, reviewed-once │
-│    `apply-skill.sh` (checked into this repo) that fans out the approved │
-│    skill into each detected agent's directory (Claude Code, Cursor,      │
-│    Codex, OpenCode, GitHub Copilot, Antigravity — the CLI's own          │
-│    `--agents` set — NOT via `aitools install` itself, see note below;    │
-│    Pi is out of scope for now)                                            │
+│  - Primary: the configured skills repo's PR (§1a, already produced by   │
+│    Phase 3's accept flow) is the trust boundary. User runs `git pull` +  │
+│    a small, reviewed-once `apply-skill.sh` (checked into the same repo,  │
+│    seeded there by the starter pack or added on first setup) that fans   │
+│    out the approved skill into each detected agent's directory (Claude   │
+│    Code, Cursor, Codex, OpenCode, GitHub Copilot, Antigravity — the       │
+│    CLI's own `--agents` set — NOT via `aitools install` itself, see      │
+│    note below; Pi is out of scope for now)                                │
 │  - Fallback: App also offers a downloadable one-off script (signed,      │
 │    short-TTL URL, writes files only, shown to the user before it's        │
-│    piped to a shell) for users without this repo cloned locally           │
+│    piped to a shell) for users without the configured repo cloned         │
+│    locally                                                                │
 │  - Every file written gets the version-tag frontmatter (see §5) so        │
 │    drift is always re-detectable                                          │
 │  - NOTE: `databricks aitools install` cannot be reused/piggybacked —      │
@@ -137,7 +144,56 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 A human always approves before a skill file changes anywhere — in the repo
 PR or on their own machine. Nothing auto-applies.
 
+## 1a. Skill repo configuration (bring-your-own-repo)
+
+Every box above that says "this repo" is really shorthand for **the
+configured skills repo for this installation** — a per-workspace setting,
+not a hardcoded value. That's what makes the app installable by someone
+else into their own workspace without forking this repo or getting push
+access to `mkgs-databricks-demos/aiSkillUpdater`.
+
+- **Setup step, once per installation**: during first-run/onboarding, the
+  App asks the user (or workspace admin) to connect a GitHub repo — owner +
+  repo name, plus credentials (see open question in §6 on OAuth App vs. a
+  PAT stored as a Databricks secret vs. a GitHub App installation). That
+  repo becomes the single target this installation reads skills from and
+  opens PRs against for the lifetime of the install (changeable later in
+  settings, but not silently).
+- **Starting point options at setup**, since a brand-new repo is empty:
+  1. **Start from scratch** — the user's repo stays empty until the first
+     accepted proposal creates its first skill directory.
+  2. **Seed from a starter pack** — copy an existing, curated skill set
+     into the user's new repo as the initial commit. "**Matt's version**"
+     (this repo, `mkgs-databricks-demos/aiSkillUpdater`) is the first
+     available starter pack; the mechanism should be generic enough to add
+     more named packs later without new code, just a registry entry
+     (pack name → source repo + ref).
+  - Either way, after setup the installation is fully independent — it
+    reads/writes only its own configured repo from then on. A starter pack
+    is a one-time seed, not an ongoing dependency.
+- **Open design question**: should a starter pack *also* be usable later as
+  an ongoing **reference source** — e.g. "diff my `databricks-jobs` skill
+  against Matt's current version" as a manual action in the Skill Library
+  browser — separate from the one-time seed at setup? Tracked in §6.
+- This has no effect on Phase 4's CLI-drift logic (still comparing against
+  the public `databricks-agent-skills` repo, independent of which skills
+  repo this installation is configured to use) or on the RSS/Research
+  Agent pipeline (workspace infra, not repo-specific) — it only changes
+  *which repo* Phase 3's accept flow and Phase 5's Local Installer target.
+
 ## 2. Build phases
+
+### Phase 0 — Workspace setup / repo configuration
+- First-run onboarding flow per §1a: connect a GitHub repo (auth mechanism
+  TBD, see §6), choose "start from scratch" vs. "seed from a starter pack"
+  (with "Matt's version" as the first available pack), and store the
+  resolved repo + credentials as the installation's configuration (a
+  Databricks App resource + secret, most likely).
+- Blocks every later phase that reads or writes skill files, so needs to
+  exist before Phase 3 (Review App accept flow) or Phase 5 (Local
+  Installer) can be exercised against anything other than this original
+  repo. Doesn't block Phase 1/2/2b, which are workspace infra and don't
+  care which skills repo is configured.
 
 ### Phase 1 — Grounding corpus (docs ingestion)
 - Scrape/sync the relevant `docs.databricks.com` sections into a UC Volume,
@@ -191,11 +247,11 @@ PR or on their own machine. Nothing auto-applies.
   accept/reject, full diff view, and a markdown editor for hand-editing the
   proposed text before accepting.
 - Markdown viewer/editor works on *any* skill file at any time (not just
-  ones with a pending proposal) — view current, edit, save back to the repo
-  as a PR.
-- Accept action forks into: (a) commit + PR to this repo (always), and
-  optionally (b) trigger the Local Installer for the current session's
-  machine.
+  ones with a pending proposal) — view current, edit, save back to the
+  configured skills repo (§1a) as a PR.
+- Accept action forks into: (a) commit + PR to the configured skills repo
+  (always), and optionally (b) trigger the Local Installer for the current
+  session's machine.
 - **Classification override**: every classified skill/bucket on a
   `research_log` entry is user-editable in the review card — the user can
   reassign it to a different existing skill, to "New Feature," or type in a
@@ -245,13 +301,15 @@ PR or on their own machine. Nothing auto-applies.
   is explicitly out of scope for this phase (no CLI-side convention exists
   and it's not a priority right now); revisit later if needed.
 - **Primary mechanism**: git-based. Phase 3's accept flow already commits
-  approved changes as a PR to this repo ("always") — extend that with a
-  small, reviewed-once `apply-skill.sh` checked into this repo that the
-  user runs after `git pull`. The script detects which of the above local
-  agents are present and fans the approved skill out to each one's own
-  directory/format. Security profile: the payload was
-  already reviewed as a PR diff; the only local execution is a small,
-  stable, auditable script rather than a freshly generated blob per action.
+  approved changes as a PR to the configured skills repo (§1a, "always") —
+  extend that with a small, reviewed-once `apply-skill.sh` checked into
+  that same repo (present from the starter pack, or added at first setup
+  for a from-scratch repo) that the user runs after `git pull`. The script
+  detects which of the above local agents are present and fans the
+  approved skill out to each one's own directory/format. Security profile:
+  the payload was already reviewed as a PR diff; the only local execution
+  is a small, stable, auditable script rather than a freshly generated
+  blob per action.
 - **Concrete per-agent raw-skill paths** (confirmed from CLI source, useful
   reference even though we're not calling the CLI itself): Claude Code
   `~/.claude/skills` (global) / `<cwd>/.claude/skills` (project); Cursor
@@ -269,8 +327,8 @@ PR or on their own machine. Nothing auto-applies.
   `apply-skill.sh` should detect plugin-vs-raw mode per agent (e.g. check
   for the CLI's own `.state.json`/plugin records) before deciding how to
   apply, rather than always writing raw files blindly.
-- **Fallback mechanism**: for users without this repo cloned, the App also
-  offers a downloadable one-off script from a short-TTL signed URL —
+- **Fallback mechanism**: for users without the configured repo cloned,
+  the App also offers a downloadable one-off script from a short-TTL signed URL —
   scoped to file-writes only (no remote `eval`), and shown to the user
   before it's piped into a shell, not silently `curl | bash`'d.
 - **Rejected**: a local companion daemon (ongoing build/sign/distribute
@@ -310,6 +368,11 @@ PR or on their own machine. Nothing auto-applies.
 
 ## 4. Suggested build order
 
+0. Phase 0 (workspace setup / repo configuration) is a prerequisite for
+   this project's *own* development too, not just for future installers —
+   even developing against this repo should exercise the same
+   configuration path (pointed at this repo) rather than hardcoding it, so
+   Phase 0's plumbing is proven from day one instead of retrofitted later.
 1. Phase 2 (RSS watcher + Research Agent), run manually against one
    real RSS entry end-to-end, to prove the fetch → summarize → cite →
    classify → propose loop works before investing in a UI.
@@ -324,6 +387,9 @@ PR or on their own machine. Nothing auto-applies.
    long enough that there's something to compare against a new CLI release.
 6. Phase 7 (schedule + alerting) once the pipeline runs unattended.
 7. Phase 6 (search + MCP server) last — pure upside, no dependents.
+8. The "starter pack" registry + multi-pack support (beyond the single
+   "Matt's version" option) is deliberately last — one working pack is
+   enough to prove Phase 0 end-to-end; more packs are additive.
 
 ## 5. Versioning scheme (proposed, revised after CLI investigation)
 
@@ -437,3 +503,25 @@ last_research_log_id: "rl_00042"
    supported agent set (Claude Code, Cursor, Codex CLI, OpenCode, GitHub
    Copilot, Antigravity). Pi is out of scope until there's a reason to
    revisit it — no invented convention needed today.
+8. **GitHub connection mechanism for §1a**: how should a workspace connect
+   its chosen GitHub repo? Options, roughly in order of setup friction vs.
+   security posture:
+   - **PAT stored as a Databricks secret** — simplest to build (Phase 0
+     MVP candidate), but a fine-grained PAT scoped to one repo is still a
+     manually-rotated credential the user has to generate themselves.
+   - **GitHub App installation** — better security posture (repo-scoped
+     installation token, no long-lived PAT, revocable from GitHub's side),
+     but requires registering and maintaining a GitHub App, which is more
+     upfront work than a secret field.
+   - **User's own GitHub OAuth token** (App acts as the logged-in user) —
+     avoids the app needing its own GitHub App registration, but ties repo
+     access to a specific human's account rather than the installation
+     itself.
+   No decision yet — needs the repo owner's input before Phase 0 is built.
+9. **Starter pack as ongoing reference, not just one-time seed**: should
+   "Matt's version" (or any starter pack) remain queryable later — e.g. a
+   "compare my `X` skill to Matt's current version" action in the Skill
+   Library browser (§1, App box) — or is it purely a one-time seed at
+   setup with no ongoing relationship to the source repo afterward? Affects
+   whether Phase 0's pack registry needs to persist a live reference (repo
+   + ref, periodically refreshed) or just a point-in-time copy operation.
