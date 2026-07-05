@@ -41,10 +41,12 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │    AWS/GCP/Azure feeds (§6 #6) to track, any combination, defaulting  │
 │    to the cloud this installation is deployed on                      │
 │  - The selected feed(s) are each published to Zerobus, landing in a  │
-│    shared bronze Delta table (`rss_bronze`) as they arrive, de-duped  │
-│    on title+link so a cross-cloud announcement (when 2-3 clouds are   │
-│    selected) doesn't trigger the pipeline more than once              │
-│  - Arrival of a new `rss_bronze` row is itself the trigger — either  │
+│    shared bronze Delta table (`rss_bronze`) — raw, append-only, no    │
+│    dedup logic at this layer, exactly as received                     │
+│  - A silver step (`rss_silver`) de-dupes on title+link (or a hash of │
+│    both) so a cross-cloud announcement (when 2-3 clouds are selected)│
+│    doesn't trigger the pipeline more than once                        │
+│  - Arrival of a new `rss_silver` row is itself the trigger — either  │
 │    a file/table-arrival-triggered Job run, or a Lakeflow Declarative │
 │    Pipeline flow that fires the Research Agent task per new row      │
 │  - Falls back to a scheduled poll of the selected feed(s) only if    │
@@ -54,7 +56,7 @@ locally-applied" — the human review step stays, it just gets a proper UI.
                               │
                               ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│ Research Agent (Job task, one run per new rss_bronze row)           │
+│ Research Agent (Job task, one run per new rss_silver row)           │
 │  1. LIVE fetch of the announcement body + every link it references — │
 │     never wait on the next scheduled corpus refresh, since same-day  │
 │     announcements often link to pages not yet indexed                │
@@ -362,22 +364,25 @@ compliance standard. Two dimensions, both extracted by the Research Agent
   broader context for the surrounding docs area.
 
 ### Phase 2 — RSS ingestion + Research Agent (the event pipeline)
-- **RSS ingestion (event-driven)**: all three official feeds — AWS
-  (`docs.databricks.com/aws/en/feed.xml`), GCP
-  (`docs.databricks.com/gcp/en/feed.xml`), and Azure
-  (`learn.microsoft.com/en-us/azure/databricks/feed.xml`), all public RSS
-  2.0, no auth (§6 #6) — are each published into Zerobus, landing as rows
-  in a shared bronze Delta table (`rss_bronze`). Ingestion de-dupes on
-  title+link (or a hash of both) before a row is considered "new," since
-  content overlaps heavily across the three clouds and a cross-cloud
-  announcement should trigger the Research Agent once, not three times.
-  New-row arrival on `rss_bronze` (post-dedup) is the trigger for the
-  Research Agent — either a file/table-arrival-triggered Job, or a step in
-  the same Lakeflow Declarative Pipeline used for ingestion (Phase 2b
-  below). This replaces a polling watcher entirely if Zerobus → bronze is
-  viable end-to-end; falls back to a scheduled poll of all three feeds +
-  an `rss_seen` dedup table otherwise.
-- **Research Agent** (one run per new `rss_bronze` row): per the
+- **RSS ingestion (event-driven)**: the installation's selected feed(s)
+  (§1a, §6 #6 — any of AWS `docs.databricks.com/aws/en/feed.xml`, GCP
+  `docs.databricks.com/gcp/en/feed.xml`, Azure `learn.microsoft.com/
+  en-us/azure/databricks/feed.xml`, all public RSS 2.0, no auth) are each
+  published into Zerobus, landing as rows in a shared bronze Delta table
+  (`rss_bronze`). **`rss_bronze` is raw and append-only** — no dedup
+  logic at that layer, every feed entry lands exactly as received. A
+  **silver table (`rss_silver`)** de-dupes on title+link (or a hash of
+  both) on top of bronze, since content overlaps heavily across clouds
+  when 2+ feeds are selected and a cross-cloud announcement should trigger
+  the Research Agent once, not multiple times. New-row arrival on
+  `rss_silver` (i.e. post-dedup) is the trigger for the Research Agent —
+  either a file/table-arrival-triggered Job, or a step in the same
+  Lakeflow Declarative Pipeline used for ingestion (Phase 2b below). This
+  replaces a polling watcher entirely if Zerobus → bronze is viable
+  end-to-end; falls back to a scheduled poll of the selected feed(s) plus
+  an `rss_seen` dedup table (playing the same role as `rss_silver`)
+  otherwise.
+- **Research Agent** (one run per new `rss_silver` row): per the
   architecture diagram above. Key design points:
   - Always does a LIVE fetch of the announcement body + every link it
     references — never relies solely on the Phase 1 corpus, since
@@ -710,13 +715,15 @@ availability:                   # see §1b — cloud + compliance-level support,
      track, defaulting to the cloud it's deployed on (auto-detection
      mechanism: see new open question #10 below). All three selectable at
      once remains supported. Content overlaps heavily across clouds, so
-     whenever 2+ feeds are selected, ingestion still needs to **de-dupe on
-     title + link** (or a hash of both) before an entry reaches
-     `rss_bronze`/triggers the Research Agent — otherwise a cross-cloud
-     announcement fires the pipeline more than once for the same
+     whenever 2+ feeds are selected, dedup on **title + link** (or a hash
+     of both) happens in a **silver table (`rss_silver`)**, not at bronze
+     — `rss_bronze` stays raw and append-only (exactly what was received,
+     no dedup logic at that layer), and the Research Agent trigger keys
+     off new `rss_silver` rows instead. Otherwise a cross-cloud
+     announcement would fire the pipeline more than once for the same
      underlying change. Phase 2's RSS ingestion is therefore a **fan-out of
-     1-3 producers (per the installation's selection) into one
-     `rss_bronze` table with a dedup key**.
+     1-3 producers (per the installation's selection) into one raw
+     `rss_bronze` table, deduped into `rss_silver`**.
 7. ~~Pi's local skill directory convention~~ — **Dropped for now, per repo
    owner**: Phase 5's Local Installer targets exactly the CLI's own
    supported agent set (Claude Code, Cursor, Codex CLI, OpenCode, GitHub
