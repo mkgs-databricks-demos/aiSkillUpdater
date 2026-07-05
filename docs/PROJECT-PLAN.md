@@ -1,145 +1,439 @@
 # aiSkillUpdater — Project Plan
 
 **Goal:** turn the current manual "run `/investigate` in Polly, review the
-diff, copy files by hand" workflow (see `docs/STAGING-AREA.md`) into a
-scheduled Databricks App that keeps the Databricks skill library current
-automatically, with a human approval gate before anything ships.
+diff, copy files by hand" workflow (see `docs/STAGING-AREA.md`) into an
+**event-driven Databricks App** that watches the Databricks Release Notes RSS
+feed, researches each announcement, drafts skill updates, and lets a human
+review + apply them to their local coding-agent skill directories — with a
+human approval gate before anything ships.
 
 ## 0. Current state (baseline)
 
 - This repo is the staging area: one directory per skill, each with an
   updated `SKILL.md` / `references/` and a `REVIEW-BEFORE-COPYING.md` diff
   summary.
-- Audits are triggered manually and run by ad hoc sub-agents that cross-check
-  each `SKILL.md` against live `docs.databricks.com` pages.
-- Deploying an update means `cp -r` from this repo into
-  `~/.databricks/aitools/skills/<name>/` on the machine running Claude Code.
+- Audits today are triggered manually and run by ad hoc sub-agents that
+  cross-check each `SKILL.md` against live `docs.databricks.com` pages.
+- The skills a user codes against locally come from `databricks aitools
+  install` (CLI subcommand, shipped since CLI v1.5.0). That command:
+  - supports a **global** (all-users) or per-user install,
+  - **auto-detects** which local AI models/tools the caller has (Claude
+    Code, Cursor, Codex CLI, OpenCode, GitHub Copilot, Antigravity) and
+    installs the matching skill variant for each,
+  - is a point-in-time snapshot: it does not itself track drift against
+    current docs, so CLI-shipped skills go stale between CLI releases too.
 
-Everything below replaces the "manual, on-demand" parts with "scheduled,
-automatic, PR-gated" — the human review step stays, it just moves from
-"review a folder" to "review a GitHub PR."
+Everything below replaces "manual, on-demand, batch-diff-against-docs" with
+"event-driven, RSS-triggered, per-announcement research, human-reviewed,
+locally-applied" — the human review step stays, it just gets a proper UI.
 
 ## 1. Target architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Databricks Job (serverless, scheduled)                          │
-│                                                                   │
-│  1. Refresh docs corpus  → UC Volume + Vector Search index        │
-│  2. For each skill in this repo (via GitHub API):                │
-│       - retrieve grounding context from the Vector Search index   │
-│       - ask an LLM (Foundation Model API / ai_query) to diff the  │
-│         skill against current docs and propose an update          │
-│       - write result row to a Delta audit-log table              │
-│       - if changed: open a branch + PR against                    │
-│         mkgs-databricks-demos/aiSkillUpdater                      │
-│  3. Post a Slack/PR summary                                       │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│ RSS Ingestion (event-driven, not pure polling)                     │
+│  - RSS feed entries are published to Zerobus, landing in a bronze   │
+│    Delta table (`rss_bronze`) as they arrive                         │
+│  - Arrival of a new `rss_bronze` row is itself the trigger — either  │
+│    a file/table-arrival-triggered Job run, or a Lakeflow Declarative │
+│    Pipeline flow that fires the Research Agent task per new row      │
+│  - Falls back to a scheduled poll of the RSS feed only if Zerobus    │
+│    ingestion isn't available end-to-end (see open question below)    │
+└───────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Databricks App (AppKit + React, thin FastAPI/Node backend)       │
-│  - Dashboard: recent audit runs, open PRs, last-updated per skill │
-│  - "Run audit now" button (per skill or full sweep) → triggers    │
-│    the Job via Jobs API                                           │
-│  - Read-only — merging/deploying is still a human GitHub action   │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│ Research Agent (Job task, one run per new rss_bronze row)           │
+│  1. LIVE fetch of the announcement body + every link it references — │
+│     never wait on the next scheduled corpus refresh, since same-day  │
+│     announcements often link to pages not yet indexed                │
+│  2. Pull current docs.databricks.com context for the subject         │
+│     (Vector Search index) as supplementary grounding                  │
+│  3. Summarize what changed, in plain language, with inline            │
+│     footnote-style citations back to every source URL used            │
+│  4. ai_classify the announcement against the taxonomy of installed    │
+│     skills (skill name + description = the label set, PLUS an         │
+│     always-present "New Feature" bucket for anything that doesn't      │
+│     fit an existing skill) to get a ranked list of affected             │
+│     skill(s)/bucket, each with a confidence score + rationale           │
+│  5. For each affected skill (or "New Feature" candidate): draft a       │
+│     proposed SKILL.md/references patch (unified diff) grounded in       │
+│     the summary + citations                                             │
+│  6. Write findings to a JSON file (one per rss entry) in a UC Volume —  │
+│     summary, citations[], skill_classifications[], proposed_diffs[],    │
+│     status ("pending_review") — designed to be auto-loaded by a          │
+│     Lakeflow Declarative Pipeline (streaming, Autoloader-based) into     │
+│     `research_log` and the Vector Search index, rather than written      │
+│     directly to Delta from the agent itself                              │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────────┐
+│ Ingestion Pipeline (Lakeflow Declarative Pipeline, streaming)       │
+│  - Autoloader watches the JSON findings volume → bronze → silver     │
+│    (`research_log` Delta table) → embeds proposed-diff text and       │
+│    updates the Vector Search index                                    │
+│  - Decouples "agent writes a file" from "data lands in queryable      │
+│    tables + search index", so the Research Agent task stays simple    │
+│    and idempotent (just write a JSON file)                            │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────────┐
+│ Databricks App (AppKit + React, thin backend)                       │
+│  Review queue:                                                       │
+│   - One card per research_log row: summary + footnoted citations,     │
+│     classified skill(s) + confidence, proposed diff per skill          │
+│   - Per-skill accept / reject / edit-then-accept                       │
+│   - Full markdown viewer + editor for any skill file (view current,   │
+│     view proposed, edit either, save)                                  │
+│  On accept:                                                            │
+│   - Writes the approved version into this repo's skill directory        │
+│     (commit + PR, never direct-to-main — same as before) AND/OR         │
+│   - Offers "Apply locally now" → runs the Local Installer (§4) against  │
+│     the machine the App can reach (see open question in §6)             │
+│  Skill Library browser:                                                │
+│   - Search/browse all skills + their version history                    │
+│   - Compare: user's maintained version vs. CLI-bundled version vs.      │
+│     latest research-proposed version, three-way                         │
+│  CLI-drift check (on new CLI release, see §2 Phase 4):                  │
+│   - Table: skill, user's base_cli_version, user's current version,      │
+│     CLI's shipped version in the new release, verdict                   │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ (only on explicit user action)
+┌───────────────────────────────────────────────────────────────────┐
+│ Local Installer — git-based (primary) + downloadable script (fallback) │
+│  - Primary: this repo's PR (already produced by Phase 3's accept flow)  │
+│    is the trust boundary. User runs `git pull` + a small, reviewed-once │
+│    `apply-skill.sh` (checked into this repo) that fans out the approved │
+│    skill into each detected agent's directory (Claude Code, Cursor,      │
+│    Codex, OpenCode, GitHub Copilot, Antigravity — the CLI's own          │
+│    `--agents` set — NOT via `aitools install` itself, see note below;    │
+│    Pi is out of scope for now)                                            │
+│  - Fallback: App also offers a downloadable one-off script (signed,      │
+│    short-TTL URL, writes files only, shown to the user before it's        │
+│    piped to a shell) for users without this repo cloned locally           │
+│  - Every file written gets the version-tag frontmatter (see §5) so        │
+│    drift is always re-detectable                                          │
+│  - NOTE: `databricks aitools install` cannot be reused/piggybacked —      │
+│    it has no source-override flag (hardcoded to                          │
+│    github.com/databricks/databricks-agent-skills). This project needs    │
+│    its own installer regardless of agent set; not this phase's           │
+│    mechanism.                                                             │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ (optional, later phase)
+┌───────────────────────────────────────────────────────────────────┐
+│ Skill Knowledge Base + MCP Server                                    │
+│  - Same Vector Search index + research_log, exposed as:                │
+│    - full-text/semantic search UI in the App                           │
+│    - a Databricks App-hosted MCP server so OTHER agents (not just       │
+│      this app's UI) can query "what's the latest on X" or "which        │
+│      skill covers Y" programmatically                                   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-A human always merges the PR (same rule Polly itself follows: sub-agents
-never merge). Deployment to the live skill directory is a separate,
-explicit step — see Phase 4.
+A human always approves before a skill file changes anywhere — in the repo
+PR or on their own machine. Nothing auto-applies.
 
 ## 2. Build phases
 
 ### Phase 1 — Grounding corpus (docs ingestion)
-- Scrape/sync the relevant `docs.databricks.com` sections (one job per
-  product area: SQL, Apps, Jobs, ML, UC, etc.) into a UC Volume.
-- Chunk + embed into a Vector Search index (reuses the
-  `databricks-vector-search` skill's index-types/end-to-end-rag patterns
-  already staged in this repo).
-- Refresh on the same schedule as the audit job (or more often) so the
-  grounding is never far behind live docs.
+- Scrape/sync the relevant `docs.databricks.com` sections into a UC Volume,
+  chunk + embed into a Vector Search index (reuses `databricks-vector-search`
+  patterns already staged in this repo).
+- This corpus is *supplementary* context, not the primary source for a given
+  announcement — the Research Agent always does a live fetch of the
+  announcement's own links first (Phase 2). This corpus just gives it
+  broader context for the surrounding docs area.
 
-### Phase 2 — Audit engine (the Job)
-- One serverless Databricks Job task, parameterized per skill or run as a
-  fan-out over all skills (`databricks-jobs` skill patterns apply).
-- Per skill: pull `SKILL.md` + `references/**` from this GitHub repo, run a
-  RAG-grounded prompt ("here is the skill text, here is current docs
-  context, list outdated claims + proposed replacement text") via `ai_query`
-  or a Model Serving endpoint fronting Claude.
-- Write one row per skill per run to a Delta table (`audit_log`): skill
-  name, run timestamp, changed (bool), summary, PR URL.
-- If the model proposes a real change: create a branch
-  (`audit/<skill>-<date>`), commit updated files + a regenerated
-  `REVIEW-BEFORE-COPYING.md`, open a PR via the GitHub REST API (token in a
-  Databricks secret scope). Never push to `main` directly.
+### Phase 2 — RSS ingestion + Research Agent (the event pipeline)
+- **RSS ingestion (event-driven)**: the RSS feed is published into Zerobus,
+  landing as rows in a bronze Delta table (`rss_bronze`). New-row arrival on
+  `rss_bronze` is the trigger for the Research Agent — either a
+  file/table-arrival-triggered Job, or a step in the same Lakeflow
+  Declarative Pipeline used for ingestion (Phase 2b below). This replaces a
+  polling watcher entirely if Zerobus → bronze is viable end-to-end; falls
+  back to a scheduled RSS poll + a `rss_seen` dedup table otherwise (see §6
+  open question — flagged for investigation).
+- **Research Agent** (one run per new `rss_bronze` row): per the
+  architecture diagram above. Key design points:
+  - Always does a LIVE fetch of the announcement body + every link it
+    references — never relies solely on the Phase 1 corpus, since
+    same-day announcements often link to pages not yet indexed.
+  - Citations are first-class output, not an afterthought: every claim in
+    the summary should be traceable to a specific fetched URL.
+  - `ai_classify` needs a maintained taxonomy — the label set is "all
+    currently installed/staged skill names + one-line descriptions," PLUS
+    an always-present **"New Feature"** bucket for announcements that don't
+    fit any existing skill well. This taxonomy must be kept in sync with
+    the skill directory (regenerate it from `SKILL.md` frontmatter each
+    run) and with any user-created buckets (see Phase 3's override flow).
+  - Output is always a *proposal* written to a JSON findings file (never a
+    direct write to a skill file or straight to Delta — see Phase 2b).
 
-### Phase 3 — Review dashboard (the App)
-- Databricks App (`databricks-apps` / `databricks-apps-python` skill
-  patterns) reading the `audit_log` Delta table.
-- Table view: skill, priority (P0/P1/P2 — reuse the existing inventory
-  table), last audited, last changed, open PR link.
-- Button to trigger an ad hoc run for one skill (calls the Jobs API
-  `run_job` with a `skill_name` job parameter) — covers the "new skill
-  installed" and "wrong code in the field" triggers from the cadence table
-  without waiting for the schedule.
+### Phase 2b — Ingestion pipeline (findings → queryable + searchable)
+- A Lakeflow Declarative Pipeline (streaming, Autoloader) watches the JSON
+  findings volume the Research Agent writes to and loads it: bronze (raw
+  JSON) → silver (`research_log` Delta table, one row per skill
+  classification per RSS entry) → embeds the proposed-diff/summary text and
+  upserts the Vector Search index.
+- This keeps the Research Agent task itself simple and idempotent (just
+  write a file); all the "land it in tables and make it searchable" logic
+  lives in one reusable streaming pipeline instead of being duplicated
+  across every place that produces findings.
 
-### Phase 4 — Deployment path
-- PRs are merged by a human on GitHub, same as any other change.
-- Add a small `sync` script (or a second, manually-triggered Job) that,
-  given a merged commit SHA, copies the changed skill directories from a
-  fresh clone into `~/.databricks/aitools/skills/` — replacing today's
-  manual `cp -r` loop in `docs/STAGING-AREA.md`.
-- If these skills are actually distributed as a Claude Code plugin
-  (marketplace-published), prefer bumping the plugin version and going
-  through the marketplace PR flow instead of a raw file copy — check
-  whether `~/.databricks/aitools/skills/` is fed by a plugin install before
-  building the file-copy path.
+### Phase 3 — Review App (the human gate + editor)
+- Databricks App (AppKit + React) reading `research_log` + the skill
+  directory.
+- Review queue UI: one card per pending research entry, with per-skill
+  accept/reject, full diff view, and a markdown editor for hand-editing the
+  proposed text before accepting.
+- Markdown viewer/editor works on *any* skill file at any time (not just
+  ones with a pending proposal) — view current, edit, save back to the repo
+  as a PR.
+- Accept action forks into: (a) commit + PR to this repo (always), and
+  optionally (b) trigger the Local Installer for the current session's
+  machine.
+- **Classification override**: every classified skill/bucket on a
+  `research_log` entry is user-editable in the review card — the user can
+  reassign it to a different existing skill, to "New Feature," or type in a
+  brand-new bucket name that doesn't exist yet in the taxonomy. Any override
+  or new-bucket creation re-triggers the skill-update generation step (Phase
+  2 step 5) for that entry under the corrected label, rather than just
+  relabeling the old proposal — so the proposed diff is always grounded in
+  the label the human actually confirmed, not the model's first guess. A
+  new bucket the user creates becomes a permanent taxonomy entry (and,
+  eventually, a new skill directory) for future classification runs.
 
-### Phase 5 — Guardrails & observability
-- Schedule: weekly, **plus** an ad hoc trigger on every new DBR major
-  release (reuses the existing cadence table in `docs/STAGING-AREA.md`).
-- Failure alerting to Slack (job failure, LLM call failure, GitHub API
-  failure) so a bad run doesn't silently stop audits.
-- Every proposed change ships as a PR, never an auto-merge — same
-  human-in-the-loop bar as the rest of this workflow.
+### Phase 4 — Version tracking + CLI-drift detection
+- **Versioning scheme** (see §5 for the concrete format): every skill file
+  this project manages carries `base_cli_version` (the `aitools`/CLI version
+  it started from) and its own independently-incrementing
+  `updated_version` / `updated_at`. This never touches or overwrites the
+  CLI's own version string.
+- **Simplified by the CLI investigation**: since skill content is fetched
+  by the CLI from the public `databricks/databricks-agent-skills` GitHub
+  repo (not bundled in the binary), and `internal/build/cli-compat.json`
+  maps CLI versions → compatible skills-repo refs, this project does **not**
+  need to install a new CLI version to see what it ships. On every new CLI
+  release: fetch that repo's `cli-compat.json` mapping (or the CLI's own
+  changelog) to resolve the new CLI version → skills-repo ref, then fetch
+  that ref's `manifest.json` + skill files directly via the same
+  `raw.githubusercontent.com` pattern the CLI itself uses. Compare the
+  fetched content + its `SKILL.md` `metadata.version` against the
+  corresponding row's `base_cli_version` + `updated_version` in this
+  project's tracking table. Three outcomes per skill:
+  1. CLI's shipped content is newer/equal → surface "CLI has caught up,
+     consider re-basing your local copy onto the CLI's version instead."
+  2. This project's `updated_version` is still ahead → no action needed,
+     flag informationally.
+  3. Both have diverged independently since the shared `base_cli_version` →
+     flag as a **conflict requiring human reconciliation** (three-way diff
+     in the App), don't silently pick a winner.
+
+### Phase 5 — Local Installer
+- **Resolved (was: reverse-engineer `aitools install`'s per-agent
+  placement)** — investigation confirmed `aitools install` cannot be
+  piggybacked: it hardcodes its source to
+  `github.com/databricks/databricks-agent-skills` (no repo/ref override
+  flag), so it can never be reused as-is even for the agents it does
+  support.
+- **Scope for now**: target exactly the CLI's own supported agent set —
+  Claude Code, Cursor, Codex CLI, OpenCode, GitHub Copilot, Antigravity. Pi
+  is explicitly out of scope for this phase (no CLI-side convention exists
+  and it's not a priority right now); revisit later if needed.
+- **Primary mechanism**: git-based. Phase 3's accept flow already commits
+  approved changes as a PR to this repo ("always") — extend that with a
+  small, reviewed-once `apply-skill.sh` checked into this repo that the
+  user runs after `git pull`. The script detects which of the above local
+  agents are present and fans the approved skill out to each one's own
+  directory/format. Security profile: the payload was
+  already reviewed as a PR diff; the only local execution is a small,
+  stable, auditable script rather than a freshly generated blob per action.
+- **Concrete per-agent raw-skill paths** (confirmed from CLI source, useful
+  reference even though we're not calling the CLI itself): Claude Code
+  `~/.claude/skills` (global) / `<cwd>/.claude/skills` (project); Cursor
+  `~/.cursor/skills`; Codex `~/.codex/skills`; GitHub Copilot
+  `~/.copilot/skills`; OpenCode `${XDG_CONFIG_HOME:-~/.config}/opencode/
+  skills` (or `$APPDATA/opencode/skills` on Windows). This is the full
+  agent set this phase targets — Pi is out of scope for now (no CLI-side
+  convention exists, and it's not a current priority; revisit later).
+- **New risk to design around**: the CLI's current default is
+  **plugin-first** for Claude Code/Codex/Copilot (each uses that agent's
+  own plugin-install mechanism; only Cursor/OpenCode/Antigravity get raw
+  files by default). If a user's Claude Code/Codex setup is plugin-managed,
+  writing raw files into `~/.claude/skills/` directly could be silently
+  overwritten or conflict on the next `aitools install`/plugin update.
+  `apply-skill.sh` should detect plugin-vs-raw mode per agent (e.g. check
+  for the CLI's own `.state.json`/plugin records) before deciding how to
+  apply, rather than always writing raw files blindly.
+- **Fallback mechanism**: for users without this repo cloned, the App also
+  offers a downloadable one-off script from a short-TTL signed URL —
+  scoped to file-writes only (no remote `eval`), and shown to the user
+  before it's piped into a shell, not silently `curl | bash`'d.
+- **Rejected**: a local companion daemon (ongoing build/sign/distribute
+  cost disproportionate to a low-frequency file-copy action, and doesn't
+  actually remove the arbitrary-code-execution problem — just relocates it
+  to the daemon's own install step).
+- Every file the installer writes gets the version-tag frontmatter from §5
+  so a later drift check can always identify provenance.
+- Optional convenience add-on, not primary: a Chromium-only "grant folder
+  access" button via the browser File System Access API, for users who
+  don't want to touch a script or git at all.
+
+### Phase 6 — Knowledge base search + MCP server (stretch)
+- Expose `research_log` + the Vector Search index as: (a) a search UI in
+  the App, and (b) a Databricks App-hosted MCP server so other agents can
+  query it programmatically (e.g. "what's the latest guidance on X",
+  "which skill covers Y").
+- This is additive — build after Phases 1–5 are solid, since it's a new
+  consumer of the same data rather than a dependency of the core loop.
+
+### Phase 7 — Guardrails & observability
+- Failure alerting to Slack (RSS fetch failure, LLM call failure, GitHub
+  API failure, ai_classify low-confidence-for-all-skills case) so a bad run
+  doesn't silently drop an announcement.
+- Every proposed change ships as a PR and/or a locally-reviewed apply —
+  never an unattended auto-merge or auto-overwrite.
 
 ## 3. Skills this reuses
-
-The staging area already contains audited skill content for every
-Databricks building block this project needs — treat these as the
-reference material while implementing each phase:
 
 | Phase | Relevant staged skill |
 |-------|------------------------|
 | Docs corpus + retrieval | `databricks-vector-search`, `databricks-unity-catalog` (volumes) |
-| Audit engine | `databricks-jobs`, `databricks-ai-functions`, `databricks-dabs` |
-| Review dashboard | `databricks-apps`, `databricks-apps-python`, `databricks-app-design` |
+| RSS watcher + Research Agent | `databricks-jobs`, `databricks-ai-functions` (`ai_classify`, `ai_query`) |
+| Review App | `databricks-apps`, `databricks-apps-python`, `databricks-app-design` |
+| Knowledge base / MCP server | `databricks-vector-search`, `databricks-model-serving` (if fronting via an endpoint) |
 | Bundling everything | `databricks-dabs` (ship Job + App as one bundle) |
 
 ## 4. Suggested build order
 
-1. Phase 2 first, run manually (no schedule) against one skill end-to-end,
-   to prove the audit-and-PR loop works before investing in retrieval
-   quality.
-2. Phase 1 (real grounding corpus) once Phase 2's prompt/loop is proven —
-   swap the "no grounding" placeholder for the Vector Search index.
-3. Phase 3 (dashboard) once there's enough audit history to be worth
-   viewing.
-4. Phase 5 (schedule + alerting) last, once a human has watched a few
-   manual runs and trusts the output enough to let it run unattended.
-5. Phase 4 (deployment sync) can happen any time after Phase 2 — it's
-   independent of the others.
+1. Phase 2 (RSS watcher + Research Agent), run manually against one
+   real RSS entry end-to-end, to prove the fetch → summarize → cite →
+   classify → propose loop works before investing in a UI.
+2. Phase 1 (real grounding corpus) alongside/soon after — the Research
+   Agent needs *some* corpus from day one, but perfect coverage isn't
+   required to prove Phase 2.
+3. Phase 3 (Review App) once there's a handful of real `research_log` rows
+   to review.
+4. Phase 5 (Local Installer) once a human has approved at least one
+   proposal in the App and wants to actually apply it.
+5. Phase 4 (CLI-drift detection) once the version-tag scheme (§5) is in use
+   long enough that there's something to compare against a new CLI release.
+6. Phase 7 (schedule + alerting) once the pipeline runs unattended.
+7. Phase 6 (search + MCP server) last — pure upside, no dependents.
 
-## 5. Open questions for the repo owner
+## 5. Versioning scheme (proposed, revised after CLI investigation)
 
-- Where does `~/.databricks/aitools/skills/` actually get populated from
-  today — a plugin install, a manual clone, something else? This decides
-  whether Phase 4 is a file copy or a plugin-marketplace version bump.
-- Which LLM should the audit engine call — a Databricks-hosted external
-  model pointing at Claude, or a Foundation Model API model? Affects the
-  `ai_query` vs. Model Serving endpoint choice in Phase 2.
-- Does "keep up to date" include auto-detecting *new* Databricks features
-  that should become entirely new skills, or only refreshing existing
-  skills? The current cadence table only covers the latter.
+The `databricks-agent-skills` repo the CLI fetches from already puts a
+`metadata.version` field in each `SKILL.md`'s YAML frontmatter (confirmed at
+`skills/databricks-core/SKILL.md:1`). Reuse that same key/location for
+consistency with the upstream format, and add this project's own fields
+alongside it rather than inventing a parallel scheme:
+
+```yaml
+metadata:
+  version: "1.5.0+au.3"        # this project's own increment; base semver segment mirrors upstream's metadata.version format
+base_cli_version: "1.5.0"       # aitools/CLI version this skill's content started from
+base_skills_repo_ref: "v1.5.0" # the databricks-agent-skills ref that base_cli_version resolved to, via cli-compat.json
+updated_at: "2026-07-05T00:00:00Z"
+last_research_log_id: "rl_00042"
+```
+
+- `base_cli_version` + `base_skills_repo_ref` are set once, at the point a
+  skill first gets tracked (or re-based per Phase 4's outcome 1). Storing
+  the resolved skills-repo ref (not just the CLI version) means Phase 4
+  never has to re-resolve the CLI-version-→-ref mapping for a historical
+  comparison.
+- `metadata.version` increments every time this project's pipeline (or a
+  human edit in the App) changes the file — independent of CLI versioning,
+  so the CLI's own release numbering is never touched or implied to be
+  something it isn't.
+- This is what makes the three-way Phase-4 comparison possible: the
+  upstream repo's `metadata.version` at the new CLI's resolved ref vs. this
+  file's `base_cli_version`/`base_skills_repo_ref` vs. its own
+  `metadata.version` tells you exactly who has moved since the shared
+  starting point.
+
+## 6. Open questions for the repo owner
+
+1. ~~Docs freshness for brand-new announcements~~ — **Resolved**: yes, the
+   Research Agent always does a live fetch of an announcement's linked URLs;
+   the Vector Search corpus is supplementary context only. Reflected in
+   Phase 2 above.
+2. ~~Local Installer reach~~ — **Resolved**: git-based PR + local
+   `apply-skill.sh` (reviewed-once, checked into this repo) is the primary
+   mechanism; a downloadable, scoped, review-before-run script is the
+   fallback for users without the repo cloned. A local companion daemon was
+   considered and rejected. Reflected in Phase 5 above. Confirmed along the
+   way: `databricks aitools install` cannot be piggybacked (no
+   source-override flag; `--agents` doesn't include Pi), so this project
+   needs its own installer regardless.
+3. ~~`aitools install` internals~~ — **Resolved.** Source: `databricks/cli`
+   (`cmd/cmd.go:108`). Key facts, all confirmed against source:
+   - Skill **content is not bundled in the CLI binary** — it's fetched over
+     HTTPS from `raw.githubusercontent.com/databricks/databricks-agent-
+     skills/<ref>/...` (`source.go:23`, `installer.go:178/221`), driven by
+     that repo's `manifest.json`. This means Phase 4's CLI-drift check can
+     just fetch that public repo directly — **no need to install new CLI
+     versions at all** to see what a given release ships. The only
+     embedded artifact is `internal/build/cli-compat.json` (`go:embed`),
+     which maps CLI versions → compatible Agent Skills repo refs
+     (`internal/build/clicompat.go:5`) — exactly the lookup Phase 4 needs
+     to resolve "CLI version X ships skills-repo ref Y."
+   - Agent detection is hardcoded to 6 agents (Claude Code, Cursor, Codex
+     CLI, OpenCode, GitHub Copilot, Antigravity) via config-dir existence
+     and `PATH` lookup (`libs/aitools/agents/agents.go:149`, `detect.go:43`)
+     — **confirms Pi has no CLI-side detection at all**, consistent with
+     the local-installer finding above.
+   - Default behavior on current `main` is **plugin-first** for
+     Claude/Codex/Copilot (uses each agent's own plugin-install mechanism);
+     only Cursor/OpenCode/Antigravity get raw skill files by default, and
+     `--skills-only` forces raw files for all agents (`install.go:64/293`).
+     **New risk flagged**: if a user's Claude Code/Codex install is
+     plugin-managed, this project's raw-file `apply-skill.sh` (Phase 5)
+     writing directly into `~/.claude/skills/` could be silently
+     overwritten or fought over on the next `aitools install`/plugin
+     update — needs a design decision (detect plugin-vs-raw mode per agent
+     before writing, most likely).
+   - Canonical local storage matches this project's existing assumption:
+     `~/.databricks/aitools/skills/<skill>` (global) or
+     `<cwd>/.databricks/aitools/skills/<skill>` (project scope)
+     (`state.go:155/164`), with a `.state.json` tracking `release`,
+     `last_updated`, per-skill versions, and per-file SHA256 provenance
+     (`state.go:28/40`). Each skill's own `SKILL.md` already carries a
+     `metadata.version` front-matter field (e.g. `skills/databricks-core/
+     SKILL.md:1`) — **this project's versioning scheme (§5) should reuse
+     that same front-matter key/location** rather than inventing a
+     parallel one, for consistency with the upstream format.
+   - No stable external Go API for programmatic reuse (internal packages
+     like `installer.InstallSkillsForAgents` exist but aren't a supported
+     surface) — confirms Phase 5 must ship its own installer logic rather
+     than importing the CLI's.
+   - `aitools` (and this whole mechanism) shipped in CLI `v1.5.0`
+     (`CHANGELOG.md:25/139`).
+4. **Upstream fix path** — **partially resolved as a side effect of #3**:
+   the source-of-truth repo is confirmed public: `github.com/databricks/
+   databricks-agent-skills`. So the mechanism for an upstream PR is no
+   longer unknown — what's still undecided is whether this project should
+   actually open PRs there once proposals are proven out. **Still marked as
+   a nice-to-have, not a blocker per repo owner** — revisit after the core
+   loop (Phases 1–5) works, but the path is no longer blocked on
+   discovering where to send it.
+5. ~~New-skill detection~~ — **Resolved**: `ai_classify`'s taxonomy always
+   includes an explicit **"New Feature"** bucket for announcements that
+   don't fit an existing skill well, and the App lets a user override any
+   classification (including typing in a brand-new bucket name). Any
+   override or new-bucket creation re-triggers skill-update generation for
+   that entry. Reflected in Phase 2 and Phase 3 above.
+6. **RSS feed identity**: confirm the exact feed URL (e.g. the release
+   notes RSS/Atom endpoint) and whether it's one feed or several
+   (per-product feeds) — affects whether ingestion is one Zerobus
+   producer/pipeline or a fan-out per feed.
+7. ~~Pi's local skill directory convention~~ — **Dropped for now, per repo
+   owner**: Phase 5's Local Installer targets exactly the CLI's own
+   supported agent set (Claude Code, Cursor, Codex CLI, OpenCode, GitHub
+   Copilot, Antigravity). Pi is out of scope until there's a reason to
+   revisit it — no invented convention needed today.
