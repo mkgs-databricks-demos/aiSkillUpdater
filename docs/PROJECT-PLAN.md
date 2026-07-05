@@ -40,20 +40,27 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │  - Per-installation cloud selection (§1a): the user picks which of    │
 │    AWS/GCP/Azure feeds (§6 #6) to track, any combination, defaulting  │
 │    to the cloud this installation is deployed on                      │
-│  - The selected feed(s) are each published to Zerobus, landing in a  │
+│  - Plain RSS 2.0 has no push/webhook primitive at all (no advertised  │
+│    WebSub/PubSubHubbub hub on any of the 3 feeds, confirmed live) —   │
+│    delivery is always "a Job fetches feed.xml on a schedule," never   │
+│    server-initiated (§6 #6); a scheduled **Databricks Job** (not the  │
+│    App — see compute-owner note below) does the fetch, using          │
+│    conditional GET (`If-None-Match` on the feed's `ETag`) so a        │
+│    no-change poll costs a ~1KB `304` not a ~1MB re-download; **daily**│
+│    cadence is enough since every `<pubDate>` across all 3 feeds is    │
+│    stamped `00:00:00 GMT` (day-granular, ~72% of recent days post)    │
+│  - New/changed items are each published to Zerobus, landing in a     │
 │    shared bronze Delta table (`rss_bronze`) — raw, append-only, no    │
 │    dedup logic at this layer, exactly as received                     │
-│  - A silver step (`rss_silver`) de-dupes on title+link within a time │
-│    window keyed off pubDate (bounded state, not a global keep-first)  │
-│    so a cross-cloud announcement (2-3 clouds selected) doesn't        │
-│    trigger the pipeline more than once                                │
+│  - A silver step (`rss_silver`) de-dupes on `<guid>` (identical to    │
+│    `<link>` in these feeds — the correct dedup key, not title+link)   │
+│    within a time window keyed off pubDate (bounded state, not a       │
+│    global keep-first) so a cross-cloud announcement (2-3 clouds       │
+│    selected) doesn't trigger the pipeline more than once              │
 │  - Arrival of a new `rss_silver` row is the trigger, via a Databricks │
 │    Jobs **Table update** trigger on `rss_silver` (`trigger.table_update`, │
 │    `condition: ANY_UPDATED`) — resolved §6 #13; not `file_arrival`,     │
 │    which only covers Volumes/external locations, not managed tables      │
-│  - Falls back to a scheduled poll of the selected feed(s) only if    │
-│    Zerobus ingestion isn't available end-to-end (see open question   │
-│    below)                                                              │
 └───────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -521,55 +528,86 @@ no efficient single-row update.
   Search endpoint/index idempotently (safe to re-run on every deploy).
 
 ### Phase 2 — RSS ingestion + Research Agent (the event pipeline)
-- **RSS ingestion (event-driven)**: the installation's selected feed(s)
-  (§1a, §6 #6 — any of AWS `docs.databricks.com/aws/en/feed.xml`, GCP
-  `docs.databricks.com/gcp/en/feed.xml`, Azure `learn.microsoft.com/
-  en-us/azure/databricks/feed.xml`, all public RSS 2.0, no auth) are each
-  published into Zerobus, landing as rows in a shared bronze Delta table
-  (`rss_bronze`). **`rss_bronze` is raw and append-only** — no dedup
-  logic at that layer, every feed entry lands exactly as received. A
-  **silver table (`rss_silver`)** de-dupes on title+link (or a hash of
-  both) **within a bounded time window keyed off each entry's `pubDate`**
-  — not an unbounded global keep-first, which would grow streaming dedup
-  state indefinitely over the feed's already-900+-item history (cross-
-  reviewed vs. `databricks-pipelines`' streaming-patterns guidance).
-  Duplicate title+link entries from a cross-cloud publish only ever arrive
-  close together in time, so a bounded window is sufficient. New-row
-  arrival on `rss_silver` (i.e. post-dedup) is the trigger for the
-  Research Agent, via a Databricks Jobs **Table update** trigger
-  (`trigger.table_update`, `table_names: ["<catalog>.<schema>.rss_silver"]`,
-  `condition: ANY_UPDATED`) — resolved §6 #13, confirmed against
-  `databricks-jobs`. This is a real, UC-table-scoped native trigger type
-  (distinct from `file_arrival`, which only covers Volumes/external
-  locations, never managed tables), and is the sole trigger mechanism (an
-  LDP flow cannot itself invoke a Job or agent as a side effect of a
-  dataflow, only write to Streaming Tables/MVs/Sinks, so the earlier "or a
-  pipeline step fires it" option was correctly dropped). **Important
-  caveat**: the trigger fires on table **commit**, not per row — the
-  Research Agent's Job must enumerate the actually-new rows itself using
-  the trigger's exposed commit version/timestamp
-  (`{{job.trigger.table_update...}}`) against an idempotent
-  processed/seen marker, optionally via Delta Change Data Feed on
-  `rss_silver` if efficient row-level change extraction is needed, rather
-  than assuming "one trigger fire = one new row." This
-  replaces a polling watcher entirely if Zerobus → bronze is viable
-  end-to-end; falls back to a scheduled poll of the selected feed(s) plus
-  an `rss_seen` dedup table (playing the same role as `rss_silver`)
-  otherwise.
+- **RSS fetch is a scheduled Databricks Job, not the App** (investigated
+  directly — plain RSS 2.0 has no push/webhook primitive; none of the 3
+  feeds advertise a WebSub/PubSubHubbub `rel="hub"` link, confirmed live
+  against all three, so a client *must* poll). The App is deliberately
+  kept out of this loop: Databricks Apps have no durable in-process
+  scheduler guarantee (status can go `Crashed`, local filesystem/in-memory
+  state is lost on restart, and horizontal scaling means multiple app
+  instances could double-fetch without an external lease) — Lakeflow Jobs'
+  documented scheduled-trigger primitive is the right owner instead. The
+  App stays focused on the review UI, run-status display, and a manual
+  "run now" control that triggers the Job.
+  - The Job fetches the installation's selected feed(s) (§1a, §6 #6 — any
+    of AWS `docs.databricks.com/aws/en/feed.xml`, GCP
+    `docs.databricks.com/gcp/en/feed.xml`, Azure `learn.microsoft.com/
+    en-us/azure/databricks/feed.xml`, all public RSS 2.0, no auth) using
+    **conditional GET** — send `If-None-Match` with the stored `ETag` from
+    the last successful fetch; all three feeds confirmed to return a
+    `304 Not Modified` (empty body) when unchanged, avoiding a ~1MB
+    re-download (each feed is 800-900 items) on every no-op poll.
+  - **Daily cadence is sufficient**: every `<pubDate>` across all three
+    feeds is stamped `00:00:00 GMT` — Databricks publishes release notes
+    per calendar day, not per clock time (confirmed: ~72% of the last 30
+    days had at least one entry). Polling more often than daily buys no
+    earlier signal; an afternoon/evening-UTC daily run aligns with when
+    the feed's `<lastBuildDate>` typically updates.
+  - Each `<item>`'s fields to extract: `<title>`, `<link>`, `<guid>`
+    (identical to `<link>` in these feeds — **use this as the dedup key**,
+    not title+link), `<pubDate>`, `<description>` (an HTML fragment inside
+    CDATA, needs a second parse if plain text is wanted), and `<category>`
+    (repeatable, ~1.9 per item on average — collect into a list, don't
+    overwrite).
+  - New/changed items are each published into Zerobus, landing as rows in
+    a shared bronze Delta table (`rss_bronze`). **`rss_bronze` is raw and
+    append-only** — no dedup logic at that layer, every feed entry lands
+    exactly as received. A **silver table (`rss_silver`)** de-dupes on
+    `<guid>` **within a bounded time window keyed off each entry's
+    `pubDate`** — not an unbounded global keep-first, which would grow
+    streaming dedup state indefinitely over the feed's already-900+-item
+    history (cross-reviewed vs. `databricks-pipelines`' streaming-patterns
+    guidance). Duplicate guid entries from a cross-cloud publish only ever
+    arrive close together in time, so a bounded window is sufficient.
+  - New-row arrival on `rss_silver` (i.e. post-dedup) is the trigger for
+    the Research Agent, via a Databricks Jobs **Table update** trigger
+    (`trigger.table_update`, `table_names: ["<catalog>.<schema>.rss_silver"]`,
+    `condition: ANY_UPDATED`) — resolved §6 #13, confirmed against
+    `databricks-jobs`. This is a real, UC-table-scoped native trigger type
+    (distinct from `file_arrival`, which only covers Volumes/external
+    locations, never managed tables), and is the sole trigger mechanism (an
+    LDP flow cannot itself invoke a Job or agent as a side effect of a
+    dataflow, only write to Streaming Tables/MVs/Sinks, so the earlier "or a
+    pipeline step fires it" option was correctly dropped). **Important
+    caveat**: the trigger fires on table **commit**, not per row — the
+    Research Agent's Job must enumerate the actually-new rows itself using
+    the trigger's exposed commit version/timestamp
+    (`{{job.trigger.table_update...}}`) against an idempotent
+    processed/seen marker, optionally via Delta Change Data Feed on
+    `rss_silver` if efficient row-level change extraction is needed, rather
+    than assuming "one trigger fire = one new row."
 - **Zerobus fit, and the compute it runs on** (cross-reviewed vs.
-  `databricks-zerobus-ingest`): Zerobus's documented use cases are
-  continuous or app-embedded producers, not a periodic "fetch a feed every
-  N minutes, push maybe 0-5 new items" batch — using it here trades some
-  setup overhead (a dedicated publishing service principal with *explicit*
-  table-level `MODIFY`+`SELECT` grants on `rss_bronze`, not just
-  schema-level; a protobuf schema; and critically, **the Zerobus Python
-  SDK cannot run on serverless compute** — the RSS→Zerobus publisher Job
-  task must run on a classic-compute cluster, or use the Zerobus REST API
-  (Beta) instead if staying serverless matters more) for the benefit of
-  reusing one ingestion pattern consistently. `rss_bronze` itself must be
+  `databricks-zerobus-ingest`, further investigated directly): Zerobus's
+  documented use cases are continuous or app-embedded producers, not a
+  periodic "fetch a feed once a day, push maybe 0-5 new items" batch —
+  using it here trades some setup overhead (a dedicated publishing service
+  principal with *explicit* table-level `MODIFY`+`SELECT` grants on
+  `rss_bronze`, not just schema-level; a protobuf schema generated from
+  the target table via `python -m zerobus.tools.generate_proto`; OAuth
+  client-credentials auth, auto-injected as `DATABRICKS_CLIENT_ID`/
+  `DATABRICKS_CLIENT_SECRET` for a Job's own service-principal identity)
+  for the benefit of reusing one ingestion pattern consistently.
+  **Correction**: no current public Databricks doc confirms the Zerobus
+  Python SDK (`databricks-zerobus-ingest-sdk`) is unusable on serverless
+  compute — the earlier flat "cannot run on serverless" claim overstated
+  a documented limitation that doesn't actually exist in writing. Default
+  to serverless for the RSS-fetch-and-publish Job task; only fall back to
+  a classic-compute cluster (or the Zerobus REST API Beta, a stateless
+  JSON alternative) if the SDK/gRPC egress empirically fails to install or
+  connect in a given workspace — verify this once during Phase 2 build-out
+  rather than assuming either outcome. `rss_bronze` itself must be
   pre-created as a UC managed Delta table (Zerobus never creates/alters
-  tables). Not a blocker, but worth this explicit tradeoff note rather
-  than assuming Zerobus is free to adopt here.
+  tables).
 - **Research Agent** (one run per new `rss_silver` row): per the
   architecture diagram above. Key design points:
   - Always does a LIVE fetch of the announcement body + every link it
@@ -966,16 +1004,21 @@ availability:                   # see §1b — cloud + region-scoped compliance 
      there is no `docs.databricks.com/azure/en/feed.xml`)
    - All three are fully public (no auth), verified live (HTTP 200,
      `application/xml`/`text/xml`), generated by the docs site's own
-     Docusaurus RSS generator. Each `<item>` has `<title>`, a deep-linked
-     `<link>` into the dated release-notes page/section, and a
-     day-granularity `<pubDate>`.
+     RSS generator (`<generator>rssFeed.ts</generator>`) — plain RSS 2.0,
+     no extra namespaces, no advertised push/WebSub hub. Each `<item>` has
+     `<title>`, `<link>`, `<guid>` (identical to `<link>` in these
+     feeds — the dedup key), a day-granularity `<pubDate>` (always
+     `00:00:00 GMT`), an HTML `<description>`, and 0..N `<category>` tags.
+     Both `ETag` and `Last-Modified` are honored for conditional GET
+     (confirmed `304` on repeat fetch) — see Phase 2 for the polling
+     mechanics this enables.
    - **Decision (revised): user-selectable per installation, not fixed**
      (§1a). Each installation picks any combination of the three feeds to
      track, defaulting to the cloud it's deployed on (auto-detection
      mechanism: see new open question #10 below). All three selectable at
      once remains supported. Content overlaps heavily across clouds, so
-     whenever 2+ feeds are selected, dedup on **title + link** (or a hash
-     of both) happens in a **silver table (`rss_silver`)**, not at bronze
+     whenever 2+ feeds are selected, dedup on **`<guid>`** happens in a
+     **silver table (`rss_silver`)**, not at bronze
      — `rss_bronze` stays raw and append-only (exactly what was received,
      no dedup logic at that layer), and the Research Agent trigger keys
      off new `rss_silver` rows instead. Otherwise a cross-cloud
