@@ -49,8 +49,9 @@ locally-applied" — the human review step stays, it just gets a proper UI.
 │    no-change poll costs a ~1KB `304` not a ~1MB re-download; **daily**│
 │    cadence is enough since every `<pubDate>` across all 3 feeds is    │
 │    stamped `00:00:00 GMT` (day-granular, ~72% of recent days post)    │
-│  - New/changed items are each published to Zerobus, landing in a     │
-│    shared bronze Delta table (`rss_bronze`) — raw, append-only, no    │
+│  - No Zerobus: this is pull, not push — the Job parses the fetched    │
+│    XML in-process and does a plain batch append (Spark/pandas write,  │
+│    no gRPC stream) straight into `rss_bronze` — raw, append-only, no  │
 │    dedup logic at this layer, exactly as received                     │
 │  - A silver step (`rss_silver`) de-dupes on `<guid>` (identical to    │
 │    `<link>` in these feeds — the correct dedup key, not title+link)   │
@@ -407,6 +408,10 @@ no efficient single-row update.
   - The starter-pack registry (pack name → source repo + ref, persisted
     for on-demand re-diff per §1a's "live reference source" design)
   - Cloud + region tracking selections (§1a)
+  - The RSS polling cursor per tracked feed (`ETag`/`Last-Modified` from
+    the last successful conditional-GET, per §2 Phase 2) — small,
+    frequently-overwritten, single-row-per-feed state, the same profile
+    as everything else on this list
   - Review-queue state: per-skill accept/reject/edit-then-accept status,
     classification overrides, and user-created taxonomy buckets (Phase 3)
   - The version-tracking table used for Phase 4's three-way CLI-drift
@@ -559,10 +564,14 @@ no efficient single-row update.
     CDATA, needs a second parse if plain text is wanted), and `<category>`
     (repeatable, ~1.9 per item on average — collect into a list, don't
     overwrite).
-  - New/changed items are each published into Zerobus, landing as rows in
-    a shared bronze Delta table (`rss_bronze`). **`rss_bronze` is raw and
-    append-only** — no dedup logic at that layer, every feed entry lands
-    exactly as received. A **silver table (`rss_silver`)** de-dupes on
+  - **No Zerobus** — RSS is pulled, not pushed, so there is no continuous
+    producer needing a streaming-ingest client at all; Zerobus would add
+    a gRPC stream, a dedicated publishing service principal, and
+    generated protobuf schemas to solve a problem this pipeline doesn't
+    have. The same notebook task that fetches the feed parses it and
+    does a **plain batch append** straight into `rss_bronze` (raw and
+    append-only) — no separate publish step, no separate compute path.
+    A **silver table (`rss_silver`)** de-dupes on
     `<guid>` **within a bounded time window keyed off each entry's
     `pubDate`** — not an unbounded global keep-first, which would grow
     streaming dedup state indefinitely over the feed's already-900+-item
@@ -586,28 +595,53 @@ no efficient single-row update.
     processed/seen marker, optionally via Delta Change Data Feed on
     `rss_silver` if efficient row-level change extraction is needed, rather
     than assuming "one trigger fire = one new row."
-- **Zerobus fit, and the compute it runs on** (cross-reviewed vs.
-  `databricks-zerobus-ingest`, further investigated directly): Zerobus's
-  documented use cases are continuous or app-embedded producers, not a
-  periodic "fetch a feed once a day, push maybe 0-5 new items" batch —
-  using it here trades some setup overhead (a dedicated publishing service
-  principal with *explicit* table-level `MODIFY`+`SELECT` grants on
-  `rss_bronze`, not just schema-level; a protobuf schema generated from
-  the target table via `python -m zerobus.tools.generate_proto`; OAuth
-  client-credentials auth, auto-injected as `DATABRICKS_CLIENT_ID`/
-  `DATABRICKS_CLIENT_SECRET` for a Job's own service-principal identity)
-  for the benefit of reusing one ingestion pattern consistently.
-  **Correction**: no current public Databricks doc confirms the Zerobus
-  Python SDK (`databricks-zerobus-ingest-sdk`) is unusable on serverless
-  compute — the earlier flat "cannot run on serverless" claim overstated
-  a documented limitation that doesn't actually exist in writing. Default
-  to serverless for the RSS-fetch-and-publish Job task; only fall back to
-  a classic-compute cluster (or the Zerobus REST API Beta, a stateless
-  JSON alternative) if the SDK/gRPC egress empirically fails to install or
-  connect in a given workspace — verify this once during Phase 2 build-out
-  rather than assuming either outcome. `rss_bronze` itself must be
-  pre-created as a UC managed Delta table (Zerobus never creates/alters
-  tables).
+- **The daily polling notebook task**, in full (single Job task, runs
+  once a day on serverless compute — no continuous producer, no gRPC
+  stream, no dedicated publishing service principal needed since it's
+  the Job's own identity doing a normal Delta write):
+  1. **Load the cursor.** For each tracked feed (§1a's cloud selection —
+     1 to 3 URLs), read that feed's stored `ETag`/`Last-Modified` pair
+     from its Lakebase polling-cursor row (§1c). First-ever run per feed
+     has no cursor — treat as an unconditional GET.
+  2. **Conditional GET.** Request the feed URL with `If-None-Match:
+     <stored ETag>` (and/or `If-Modified-Since: <stored Last-Modified>`
+     as a fallback for servers that only honor one). A `304 Not
+     Modified` response (confirmed live for all three feeds) means
+     nothing changed since last run — skip straight to step 5 for this
+     feed, no parsing needed. A `200 OK` means new content; capture the
+     response's fresh `ETag`/`Last-Modified` headers for step 5.
+  3. **Parse.** On `200`, parse the RSS 2.0 XML with a standard library
+     (e.g. `feedparser` or `xml.etree`) into a list of item records,
+     extracting `<title>`, `<link>`, `<guid>` (the dedup key — identical
+     to `<link>` in these feeds), `<pubDate>`, `<description>` (HTML
+     inside CDATA), and all repeated `<category>` values as a list.
+     Stamp each record with which feed/cloud it came from and the
+     current run's timestamp.
+  4. **Append to bronze.** Build a small DataFrame (pandas → Spark, or
+     Spark directly) from the parsed items and write it with
+     `.write.format("delta").mode("append")` straight to `rss_bronze` —
+     one plain batch write per run, not a per-item streaming call.
+     `rss_bronze` must already exist as a UC managed Delta table (created
+     once, by the DAB or a setup step) with a schema matching these
+     fields plus the feed/cloud/run-timestamp stamps from step 3.
+  5. **Save the cursor.** Whether this feed returned `200` (new
+     `ETag`/`Last-Modified`) or `304` (headers unchanged, but still worth
+     refreshing the "last checked" timestamp for observability), upsert
+     that feed's row back into the Lakebase cursor table (§1c) so the
+     next day's run starts from the right conditional-GET state.
+  6. Repeat steps 1–5 independently per tracked feed within the same
+     task run — a `304` on the AWS feed and a `200` on the Azure feed in
+     the same run is the normal case, not an error path.
+
+  This task needs no gRPC client, no protobuf schema generation, and no
+  auth beyond the Job's own service-principal identity (which already has
+  `MODIFY`+`SELECT` on `rss_bronze` and read/write on its Lakebase schema
+  per §1c) — it is a plain HTTP-fetch-then-Delta-write, exactly the shape
+  a scheduled Databricks Job notebook task is built for. Runs on
+  **serverless compute** by default; nothing in this design has any
+  compute-tier requirement, so there's no fallback-to-classic case to plan
+  for here (that concern was specific to the Zerobus SDK's own egress
+  behavior, which is no longer part of this pipeline).
 - **Research Agent** (one run per new `rss_silver` row): per the
   architecture diagram above. Key design points:
   - Always does a LIVE fetch of the announcement body + every link it
