@@ -6,15 +6,17 @@ build Phase 2; it does not re-litigate design decisions already locked
 there — if something here seems to conflict with `PROJECT-PLAN.md`, that
 file wins and this plan is stale.
 
-**Cross-reviewed:** pending — see the changelog at the bottom of this file,
-filled in once independent review lands.
+**Cross-reviewed:** an independent structural pass (`pi`) and an
+independent Databricks-mechanics fact-check pass (`codex`) both reviewed a
+first draft of this plan; every BLOCKING finding from both is folded into
+the version below. See the changelog at the bottom of this file.
 
 **Why this phase is second (per `PROJECT-PLAN.md` §4's build order):** the
 suggested build order runs Phase 2 *before* Phase 1 (grounding corpus)
 deliberately — proving the fetch → summarize → cite → classify → propose
 loop against one real RSS entry matters more early than having a complete
 docs corpus. This plan therefore treats the Research Agent's corpus-lookup
-step as **optional and best-effort** (see §5 Part F step 2) rather than a
+step as **optional and best-effort** (see §5 Part F step 13) rather than a
 hard dependency on Build Plan 02, which hasn't been built yet when this
 plan is implemented.
 
@@ -54,7 +56,7 @@ it never writes to Delta directly and never touches a skill file.
   and `tracked_regions` (Lakebase, owned by Build Plan 00's schema) and
   needs a working GitHub App connection (to list the configured skills
   repo's current `SKILL.md` files for the classification taxonomy, §5 Part
-  F step 4).
+  F step 15).
 - The **`-infra` bundle** already exists (UC catalog/schema, secret scope,
   Lakebase instance, App service principal) — this plan adds new resources
   to that same bundle, per §3 below; it does not create a fourth bundle.
@@ -69,6 +71,18 @@ it never writes to Delta directly and never touches a skill file.
   `PROJECT-PLAN.md` §2 Phase 2's locked assumption — this is a one-time,
   workspace-level admin action, not something this plan's automation can
   self-provision (no documented API for the Previews toggle).
+- **Separate, higher DBR/compute requirement for the Research Agent Job
+  specifically (Part F only — does not apply to the polling Job, Part
+  C)**: `ai_query`, `ai_classify`, and `ai_extract` (as of this writing)
+  require DBR ≥ 18.2 and run only on **serverless** compute for
+  notebooks/workflows — they are not available on Pro or Classic SQL
+  warehouses. The Research Agent Job's task must be configured for
+  serverless compute with a DBR meeting that floor; confirm this is
+  compatible with whatever DBR the target workspace/bundle otherwise pins
+  before finalizing the task's compute config. Note this is a *higher*
+  floor than Variant Shredding's ≥17.2 above — meeting the AI Functions
+  floor automatically satisfies the Variant Shredding one, not the other
+  way around.
 
 ## 3. Bundle placement (per `PROJECT-PLAN.md` §1d)
 
@@ -78,14 +92,14 @@ it never writes to Delta directly and never touches a skill file.
 | Service principal — RSS/Research Job | `-infra` | New in this plan (Build Plan 00 only created the App's own SP). One shared SP runs both the polling Job and the Research Agent Job (§5 Part A) — see §10 for why this plan didn't split them into two. |
 | `rss_bronze` → `rss_silver` Lakeflow Declarative Pipeline | `-infra` | Per §1d: produces a Delta table `-ai-tools`'s future Vector Search index doesn't directly sync from (only `research_log` does, via Build Plan 03) — `rss_silver` itself is purely internal plumbing, not indexed. |
 | RSS polling Job (scheduled, daily) | `-infra` | Writes only to `-infra`-owned tables. |
-| Research Agent Job (`trigger.table_update` on `rss_silver`) | `-infra` | **Design call made in this plan** (not explicit in `PROJECT-PLAN.md` §1d): placed in `-infra`, matching the RSS polling Job's rationale — it only *writes* to an `-infra`-owned UC Volume (JSON findings) and *optionally, best-effort* reads the `-ai-tools` docs-corpus Vector Search index (§5 Part F step 2) as a runtime dependency, not a deploy-time one. See §10. |
+| Research Agent Job (`trigger.table_update` on `rss_silver`) | `-infra` | **Design call made in this plan** (not explicit in `PROJECT-PLAN.md` §1d): placed in `-infra`, matching the RSS polling Job's rationale — it only *writes* to an `-infra`-owned UC Volume (JSON findings) and *optionally, best-effort* reads the `-ai-tools` docs-corpus Vector Search index (§5 Part F step 13) as a runtime dependency, not a deploy-time one. See §10. |
 | JSON findings UC Volume | `-infra` | Created by this plan since the Research Agent is this plan's own deliverable; Build Plan 03 (Phase 2b) only ever *reads* this volume, does not create it. |
 | RSS polling cursor + Research Agent watermark tables (Lakebase) | `-infra` (App's Postgres schema) | See §4. Added to the *same* schema Build Plan 00 created, using the same migration mechanism. |
 
 `-ai-tools` is not touched by this plan at all — the docs-corpus Vector
 Search index it would eventually host (Build Plan 02) does not exist yet,
 and this plan's Research Agent is explicitly built to degrade gracefully
-without it (§5 Part F step 2). Do not add a hard dependency on `-ai-tools`
+without it (§5 Part F step 13). Do not add a hard dependency on `-ai-tools`
 anywhere in this plan's task list.
 
 ## 4. Data model
@@ -129,24 +143,43 @@ DLT-managed, reads `STREAM(rss_bronze)`):
 | `source_feed_clouds` | ARRAY<STRING> | Which cloud feed(s) reported this `guid` within the dedup window — populated by merging bronze rows that share a `guid`, not just keeping the first-seen one, since a cross-cloud announcement legitimately has cloud-specific availability nuance the Research Agent may want later |
 | `first_seen_at` | TIMESTAMP | Earliest `fetched_at` among the merged bronze rows for this `guid` |
 
-Dedup mechanism (Spark Structured Streaming / Lakeflow Declarative
-Pipelines idiom): `dropDuplicatesWithinWatermark` on `guid` with a
-watermark on `pub_date` (e.g. `withWatermark("pub_date", "3 days")`) — a
-3-day window is generous given all cross-cloud publishes of the same
-`guid` are expected to land within the same daily poll cycle or the next
-one, and keeps streaming dedup state bounded rather than growing across
-the feed's 900+-item history. **Merging** `source_feed_clouds`/keeping the
-earliest `first_seen_at` across duplicate `guid`s within that window
-requires an aggregation step (e.g. `groupBy(guid).agg(...)` inside the
-flow), not a plain `dropDuplicates` that discards the later rows' cloud
-info outright — confirm this against current Lakeflow Declarative
-Pipelines streaming-aggregation support before implementing; if
-streaming aggregation + dedup in one flow proves awkward, an acceptable
-fallback is two chained flows (dedup first, keeping first-seen only, then
-a second small batch/micro-batch step that backfills `source_feed_clouds`
-by re-scanning bronze for the same `guid` within the window) — pick
-whichever the implementer finds cleaner, but don't silently drop the
-cross-cloud info; that's a real design requirement, not a nice-to-have.
+**Dedup mechanism — two-flow design, primary (not a fallback)**: a single
+unwindowed `groupBy(guid).agg(...)` cannot coexist with
+`dropDuplicatesWithinWatermark` in one Lakeflow Declarative Pipelines flow
+— `dropDuplicatesWithinWatermark` is specifically designed to *drop* later
+duplicate rows, not merge their column values, and Databricks' own
+streaming-aggregation guidance uses watermarked *windowed* aggregations,
+not an unwindowed per-key `groupBy` emitting one final append row
+(cross-review finding — the single-flow approach in an earlier draft of
+this plan was unrealistic). Use two chained flows instead:
+1. **Dedup flow**: `STREAM(rss_bronze)` → `dropDuplicatesWithinWatermark`
+   on `guid` with `withWatermark("pub_date", "3 days")` (a 3-day window is
+   generous given all cross-cloud publishes of the same `guid` are
+   expected to land within the same daily poll cycle or the next one) →
+   writes a first-seen-only version of `rss_silver` (all columns above
+   except `source_feed_clouds` populated from whichever bronze row won
+   the dedup).
+2. **Backfill flow**: a small batch/micro-batch step, triggered after
+   flow 1 within the same pipeline run, that re-scans `rss_bronze` for
+   every `guid` written by flow 1 in this run (bounded to that run's new
+   rows, not a full table scan) and updates that row's
+   `source_feed_clouds` (all distinct `feed_cloud` values seen for that
+   `guid` within the window) and `first_seen_at` (earliest `fetched_at`
+   among them). This is a plain bounded read + targeted update, not a
+   second unbounded streaming aggregation.
+Do not silently drop the cross-cloud info by skipping step 2 — that's a
+real design requirement, not a nice-to-have.
+
+**`rss_silver` must itself declare CDF + Row Tracking** (via the pipeline's
+table-definition `table_properties`, e.g.
+`table_properties={"delta.enableChangeDataFeed": "true", "delta.enableRowTracking": "true"}`
+on the `rss_silver` table definition) — `TABLE_CHANGES`/CDF-based reads in
+§5 Part F step 11 require CDF to actually be enabled on `rss_silver`
+itself; it is **not** inherited automatically from `rss_bronze` having it.
+Confirm the exact current Lakeflow Declarative Pipelines syntax for
+setting Delta table properties on a streaming-table definition before
+implementing (field/decorator names may differ from a plain `CREATE
+TABLE`'s `TBLPROPERTIES`).
 
 **JSON findings file schema** (one file per `rss_silver` row, written by
 the Research Agent to the UC Volume — **this is a contract Build Plan 03
@@ -203,8 +236,29 @@ Design notes on this schema (record decisions, don't leave them implicit):
   Plan 00) — never every region Databricks supports.
 - `availability.compliance.fedramp_moderate` is `"false"` (never
   `"unknown"`) for any tracked region outside the FedRAMP Moderate
-  authorization boundary (4 specific `us-*` regions, AWS-only) — per
-  §1b, the boundary itself is documented and definitive.
+  authorization boundary — per §1b, that boundary is a small,
+  documented, fixed set of `us-*` AWS regions (4 as of `PROJECT-PLAN.md`'s
+  writing), definitive rather than a judgment call. **This plan does not
+  hardcode the specific region list** — the Research Agent's step 16
+  fetch of the live FedRAMP Moderate page (§5 Part F step 16) is exactly
+  what determines the current boundary each time it runs, so a future
+  change to that boundary is picked up automatically rather than needing
+  a code change here. An implementer building this from scratch (without
+  also reading `PROJECT-PLAN.md` §1b/§6 #11) should fetch
+  `docs.databricks.com/aws/en/security/privacy/fedramp` directly to see
+  the current authorized-region list before writing the boundary-check
+  logic — do not guess or hardcode a list from memory.
+- **`no_csp` availability's source, not stated elsewhere in this file**:
+  unlike the three named compliance standards, "No CSP" (standard,
+  non-CSP workspace) availability comes from the main CSP/security-profile
+  overview page — `docs.databricks.com/aws/en/security/privacy/
+  security-profile` (§1b) — which also carries the cross-feature
+  preview/beta support table. Treat a feature as `no_csp: "true"` for a
+  tracked region once the live-fetched announcement/docs (step 12/13)
+  confirm general availability in that region, `"unknown"` if GA status
+  in that specific region isn't confirmed by any fetched source, and only
+  ever `"false"` if a source explicitly states the feature is unavailable
+  there.
 - `target_skill_path` is `null` when `label` is `"New Feature"` or a
   user-created bucket with no existing skill file yet (Build Plan 04's
   override flow handles turning that into an actual new skill later) —
@@ -274,15 +328,19 @@ profile.
    `rss_silver_watermark` tables plus read-only access to
    `installations`/`tracked_clouds`/`tracked_regions` (needs to read
    Build Plan 00's tables, never write them).
-3. Grant this SP read access to the configured skills repo via the
-   GitHub App installation token flow (Build Plan 00, §1a) — the Research
-   Agent (Part F step 4) needs to list current `SKILL.md` files to build
-   the classification taxonomy. Confirm with Build Plan 00's actual
-   implementation whether "mint an installation token" is something any
-   SP can trigger, or whether it's scoped to the App's own runtime
-   identity only — if the latter, the Research Agent Job must call back
-   into the App (or a shared internal library/endpoint) to get a token
-   rather than minting one itself. **Resolve this before Part F step 4 is
+3. This SP needs read access to the configured skills repo — the
+   Research Agent (Part F step 15) needs to list current `SKILL.md`
+   files to build the classification taxonomy — but **which of two
+   designs gets this SP that access is genuinely undecided, not just
+   unconfirmed**: (a) grant this SP direct use of Build Plan 00's GitHub
+   App installation token flow (§1a) so it mints a token itself, or (b)
+   have the Research Agent Job call back into the App (or a shared
+   internal library/endpoint) to obtain a token, if minting turns out to
+   be scoped to the App's own runtime identity only. Build Plan 00's own
+   doc does not itself grant the Research Agent SP secret access or
+   define an internal token-mint endpoint, so this cannot be resolved by
+   re-reading that plan alone — it needs a decision made when Build Plan
+   00 is actually implemented. **Resolve this before Part F step 15 is
    built**; don't assume either answer without checking.
 
 ### Part B — JSON findings UC Volume (`-infra`)
@@ -341,13 +399,16 @@ profile.
 
 ### Part D — `rss_bronze` → `rss_silver` pipeline (`-infra`)
 
-8. Build the Lakeflow Declarative Pipeline per §4's `rss_silver` schema
-   and dedup mechanism (streaming, `STREAM(rss_bronze)` source,
-   `dropDuplicatesWithinWatermark` on `guid` with a `pub_date` watermark,
-   plus the `source_feed_clouds`/`first_seen_at` merge logic). Confirm
-   the exact streaming-aggregation-plus-dedup approach against current
-   Lakeflow Declarative Pipelines documentation before implementing (see
-   §4's fallback note if a single-flow approach proves unsupported).
+8. Build the two chained Lakeflow Declarative Pipeline flows per §4's
+   `rss_silver` schema and dedup mechanism: the dedup flow
+   (`STREAM(rss_bronze)` → `dropDuplicatesWithinWatermark` on `guid` with
+   a `pub_date` watermark) and the backfill flow (bounded re-scan of
+   `rss_bronze` to populate `source_feed_clouds`/`first_seen_at` for that
+   run's newly-written rows). Confirm the exact current Lakeflow
+   Declarative Pipelines syntax for chaining a batch step after a
+   streaming flow within one pipeline before implementing — the two-flow
+   shape itself is the settled design (§4), not something to second-guess
+   back into a single unwindowed `groupBy`.
 9. This pipeline is the sole DLT-managed writer of `rss_silver` — nothing
    else ever writes to it directly (consistent with `rss_bronze` being
    the sole *reader* source, per the earlier LDP-vs-`http_request`
@@ -376,16 +437,27 @@ profile.
 11. On trigger fire, first **enumerate the actually-new rows** — do not
     assume one trigger firing maps to one new row. Read
     `rss_silver_watermark.last_processed_commit_version` for this
-    installation; use Delta Change Data Feed on `rss_silver`
-    (`TABLE_CHANGES('main.<schema>.rss_silver', last_processed_commit_version + 1)`,
-    or the trigger payload's own exposed commit version if that's
-    sufficient — confirm which is more reliable against current Jobs
-    trigger documentation) to get every row committed since the last
-    successful run. Process each such row as one RSS entry through steps
-    2–7 below; only advance `last_processed_commit_version` after **all**
-    entries in this batch have been written to the findings Volume
-    (partial-batch failure should not silently skip re-processing on
-    retry — see §7).
+    installation (call it `start_version`); separately capture an
+    explicit `end_version` for this run — either the trigger payload's
+    own exposed commit version (if the trigger config exposes one
+    reliably; confirm against current Jobs trigger documentation) or, if
+    not, the table's latest committed version at the moment this step
+    runs (e.g. via `DESCRIBE HISTORY` or an equivalent version-lookup
+    call) captured *before* any further processing. Then call
+    `table_changes('main.<schema>.rss_silver', start_version + 1,
+    end_version)` — an explicit bounded `[start, end]` range, **not**
+    an open-ended "start to latest" call — so that any `rss_silver` commit
+    that lands *after* this run starts is deliberately excluded from this
+    run and picked up cleanly by the next one, rather than being
+    nondeterministically included or excluded depending on timing.
+    `table_changes` requires CDF to actually be enabled on `rss_silver`
+    (see §4's new note on this) — this will fail loudly, not silently
+    return nothing, if that property is missing. Process each row in
+    the resulting change set as one RSS entry through steps 12–18 below;
+    only advance `rss_silver_watermark.last_processed_commit_version` to
+    this run's `end_version` after **all** entries in this batch have
+    been written to the findings Volume (partial-batch failure should not
+    silently skip re-processing on retry — see §7).
 12. For each new `rss_silver` row, **live-fetch** the announcement's
     `link` plus every URL referenced in its `description`/body — never
     rely solely on a cached corpus, since same-day announcements often
@@ -408,22 +480,27 @@ profile.
     `{id, url, title}`. Structure the prompt/output contract so this is
     parseable into the JSON schema's `summary`/`citations` fields
     directly, not free-text requiring a second parse.
-15. **Classify with `ai_classify`** (multilabel). Build the label set
-    fresh each run from the configured skills repo's current `SKILL.md`
-    files (name + one-line description each), **plus** an always-present
-    `"New Feature"` label, **plus** any user-created bucket names already
-    recorded from prior overrides (Build Plan 04 — if that table doesn't
-    exist yet when this plan is built, the taxonomy is just skills +
-    "New Feature" for now; extend once Build Plan 04 lands). Guardrails
-    (cross-reviewed limits already locked in `PROJECT-PLAN.md` §2 Phase
-    2): keep each label ≤100 chars and description ≤1000 chars, keep the
-    taxonomy well under the documented 500-label ceiling, pass extended
-    classification context via the function's `instructions` option
-    rather than inflating the label list itself. `ai_classify` returns
-    **no native confidence/rationale** — do not populate those fields in
-    the JSON schema (they aren't in it above, deliberately); if the
-    Review App (Build Plan 04) wants them later, that's a separate small
-    LLM call, not something to retrofit here.
+15. **Classify with `ai_classify`**, explicitly pinned to
+    `options => map('version', '2.0', 'multilabel', 'true', 'instructions', <taxonomy context>)`
+    — the multilabel behavior, per-label descriptions, and up to
+    500-label capacity this plan relies on are v2-only; the older
+    default/v1 behavior has materially smaller limits and no multilabel
+    mode. Build the label set fresh each run from the configured skills
+    repo's current `SKILL.md` files (name + one-line description each),
+    **plus** an always-present `"New Feature"` label, **plus** any
+    user-created bucket names already recorded from prior overrides
+    (Build Plan 04 — if that table doesn't exist yet when this plan is
+    built, the taxonomy is just skills + "New Feature" for now; extend
+    once Build Plan 04 lands). Guardrails (cross-reviewed limits already
+    locked in `PROJECT-PLAN.md` §2 Phase 2): keep each label ≤100 chars
+    and description ≤1000 chars, keep the taxonomy well under the
+    documented 500-label ceiling, pass extended classification context
+    via the function's `instructions` option rather than inflating the
+    label list itself. `ai_classify` returns **no native
+    confidence/rationale** — do not populate those fields in the JSON
+    schema (they aren't in it above, deliberately); if the Review App
+    (Build Plan 04) wants them later, that's a separate small LLM call,
+    not something to retrofit here.
 16. **Extract availability with `ai_extract`**, scoped to this
     installation's `tracked_regions` (never every region Databricks
     supports): cloud availability (AWS/Azure/GCP) from the fetched
@@ -431,18 +508,30 @@ profile.
     fixed "Regional support for features" pages (`docs.databricks.com/
     aws/en/security/privacy/{hipaa,pci,fedramp}` — this is a periodic
     reference fetch against fixed URLs, independent of what the
-    announcement itself links to, per §1b) for each tracked region. Model
-    the tri-state as a string enum in the extraction schema, not a
-    boolean (§1b's `ai_extract`-schema guidance); keep the schema within
-    documented limits (≤128 fields, ≤7 nesting levels) by scoping to just
-    this installation's tracked clouds/regions; access the returned
-    VARIANT via `result:response:...` path syntax. `fedramp_moderate` is
-    only ever assessed for AWS-tracked regions (§1b) — skip the call
-    entirely for non-AWS regions rather than asking the model and getting
-    a meaningless answer.
+    announcement itself links to, per §1b), plus `no_csp` from the
+    security-profile overview page (see §4's new note on its source) —
+    all for each tracked region. Model the tri-state as a string enum in
+    the extraction schema, not a boolean (§1b's `ai_extract`-schema
+    guidance); keep the schema within documented limits (≤128 fields,
+    ≤7 nesting levels) by scoping to just this installation's tracked
+    clouds/regions. **Pin `options => map('version', '2.0')` explicitly**
+    — current `ai_extract` v2.1 changes the return shape so each scalar
+    field comes back as an object (`{value, citation_ids,
+    confidence_score}`) rather than the raw value, which would require
+    every `result:response:<field>` access in this plan to become
+    `result:response:<field>:value` instead. Pinning `2.0` keeps
+    `result:response:...` returning the plain scalar directly, matching
+    every access pattern described in this plan and in `PROJECT-PLAN.md`
+    §1b. If a future revision of this plan moves to v2.1 for its
+    per-field confidence scores, every `result:response:...` reference in
+    this file must be updated to the `:value` form at the same time —
+    don't mix versions. `fedramp_moderate` is only ever assessed for
+    AWS-tracked regions (§1b) — skip the call entirely for non-AWS
+    regions rather than asking the model and getting a meaningless
+    answer.
 17. **Draft a proposed diff per classified skill/bucket** — a unified
     diff against the skill's current `SKILL.md`/references content
-    (fetched via the same GitHub App token as step 4/Part A step 3) for
+    (fetched via the same GitHub App token as step 15/Part A step 3) for
     an existing skill, or drafted new content (no diff, since there's no
     base file) for `"New Feature"`/a new bucket. Ground the draft in the
     step 14 summary + citations + step 16 availability findings — never
@@ -469,7 +558,7 @@ profile.
 **Preconditions (block everything else in this plan):**
 - Build Plan 00 must be deployed and have at least one `completed`
   installation before *any* of this plan's tasks can be meaningfully
-  tested end-to-end (Part C step 7 reads `tracked_clouds`; Part F step 4
+  tested end-to-end (Part C step 7 reads `tracked_clouds`; Part F step 15
   reads the configured repo via the GitHub App token flow).
 - The Lakebase migration mechanism and the "one Job serves N installations
   vs. one Job per installation" model (§5 Part C step 7) must both be
@@ -481,9 +570,19 @@ profile.
 - Part A (table + SP + repo-token-access grants), Part B (Volume + naming
   convention), and the Lakebase `rss_polling_cursor`/
   `rss_silver_watermark` table creation (§4) touch entirely separate
-  bundle resources and Lakebase schema objects — three independent
-  sub-agent tasks, coordinated the same way Build Plan 00's §6 recommends
-  for concurrent `databricks.yml` edits (serialize edits to the shared
+  bundle resources and Lakebase schema objects for their *creation* work
+  — three independent sub-agent tasks can draft each in parallel, the
+  same coordination Build Plan 00's §6 uses for concurrent
+  `databricks.yml` edits. **However, mirroring Build Plan 00's own
+  caveat**: Part A step 2's *grants* (`SELECT` on `rss_silver`, read/write
+  on the findings Volume, read on the two new Lakebase tables) target
+  objects Part D, Part B, and the Lakebase-table task respectively
+  create — so Part A can be drafted in parallel with the other two, but
+  its grants cannot be *applied and verified* until those objects
+  actually exist. Don't mark Part A "done" independent of that
+  dependency; only its table-DDL/SP-creation scaffolding is truly
+  parallel. Coordinate concurrent `databricks.yml`/schema-migration file
+  edits the same way (serialize edits to the shared
   bundle file, or have one task own it and the others submit patches).
 - Within Part F, steps 14 (`ai_query` synthesis), 15 (`ai_classify`), and
   16 (`ai_extract`) are **not** independent of each other in the sense of
@@ -542,12 +641,22 @@ Vector-Search read is designed to no-op without it), sharing only the
   installation/workspace — confirmed in §2's Prerequisites; if a
   workspace hasn't enabled it, Part A step 1's `CREATE TABLE` will fail,
   not silently skip the feature.
-- **`ai_classify` guardrails** (§5 Part F step 15): ≤100 char labels,
-  ≤1000 char descriptions, taxonomy well under the 500-label ceiling, no
-  native confidence/rationale output.
-- **`ai_extract` guardrails** (§5 Part F step 16): tri-state as string
-  enum not boolean, ≤128 fields / ≤7 nesting levels, `result:response:...`
-  path access on the returned VARIANT.
+- **AI Functions need a higher DBR/compute floor than Variant Shredding**
+  (§2 Prerequisites): `ai_query`/`ai_classify`/`ai_extract` require
+  DBR ≥18.2 and serverless compute (no Pro/Classic SQL warehouse support)
+  — this applies only to the Research Agent Job (Part F), not the polling
+  Job (Part C), which has no such requirement.
+- **`ai_classify` guardrails** (§5 Part F step 15): pin
+  `options => map('version', '2.0', 'multilabel', 'true', ...)` — v1/
+  default behavior lacks multilabel mode and has much smaller limits.
+  ≤100 char labels, ≤1000 char descriptions, taxonomy well under the
+  500-label ceiling, no native confidence/rationale output.
+- **`ai_extract` guardrails** (§5 Part F step 16): pin
+  `options => map('version', '2.0')` — v2.1 wraps each scalar field in an
+  object (`{value, citation_ids, confidence_score}`), which changes every
+  `result:response:...` access in this plan to need a `:value` suffix;
+  staying on 2.0 keeps direct scalar access. Tri-state as string enum not
+  boolean, ≤128 fields / ≤7 nesting levels.
 - **Non-throwing batch execution** (§5 Part F step 19): every AI Function
   call in this Job must use error-capturing execution; a single bad call
   must never abort the whole run.
@@ -641,7 +750,7 @@ Vector-Search read is designed to no-op without it), sharing only the
 - **Whether the Research Agent SP can mint GitHub installation tokens
   itself, or must call back into the App** (§5 Part A step 3) — must be
   resolved against Build Plan 00's actual implementation before Part F
-  step 4/17 are built; record the answer here once known.
+  step 15/17 are built; record the answer here once known.
 - **One Job instance serving all installations vs. one Job per
   installation** (§5 Part C step 7) — must be decided and recorded before
   Part C/Part F are fully scoped; this plan's task descriptions are
@@ -650,11 +759,14 @@ Vector-Search read is designed to no-op without it), sharing only the
 - **Exact JSON findings file naming/layout convention** (§5 Part B step
   5) — pick one, record it here, since Build Plan 03's Autoloader source
   path depends on it.
-- **Streaming aggregation + dedup approach for `rss_silver`'s
-  `source_feed_clouds` merge** (§4) — confirm the single-flow
-  `groupBy`-based approach works in current Lakeflow Declarative
-  Pipelines before committing to it over the two-flow fallback also
-  described there.
+- **Exact daily polling Job schedule hour** (§5 Part C step 6) — pick a
+  specific afternoon/evening-UTC hour and record it here once chosen.
+- **`table_changes` boundary source for Part F step 11** — whether the
+  `end_version` bound comes from the trigger payload's own exposed commit
+  version or a separate `DESCRIBE HISTORY`-style lookup at run start, and
+  whether the `trigger.table_update` config needs/benefits from debounce
+  options — confirm the current Jobs trigger API's exact shape and record
+  the choice here before finalizing Part E/Part F step 11.
 - **Confidence/rationale for classifications**, if the Review App (Build
   Plan 04) ends up wanting them — deliberately not built here since
   `ai_classify` doesn't provide them natively (§5 Part F step 15); would
@@ -666,5 +778,34 @@ Vector-Search read is designed to no-op without it), sharing only the
 
 ---
 
-**Changelog from cross-review:** _pending — filled in once independent
-review lands._
+**Changelog from cross-review:** fixed a systemic off-by-10 internal
+cross-reference bug where the header, §2, §3, and parts of §5 cited Part
+F's steps with local 1-based numbers while §6/§7/§8 correctly used the
+document's actual continuous global numbering (11–20) — standardized on
+the global numbering everywhere, plus fixed a similar stray "steps 2–7"
+reference inside step 11 itself; added two previously-untracked deferred
+decisions to §10 (the polling schedule's exact hour, and the
+`table_changes` boundary/debounce source); enumerated the previously
+unsourced `no_csp` compliance-availability fetch path and de-hardcoded
+the FedRAMP region list (now explicitly sourced live from the fetched
+page each run, not asserted in this file); replaced the unrealistic
+single-flow `dropDuplicatesWithinWatermark` + unwindowed `groupBy`
+dedup/merge design with a two-chained-flow design as primary (dedup flow
++ a bounded backfill flow), since the two cannot coexist in one flow as
+originally drafted; added missing CDF/Row Tracking table properties for
+`rss_silver` itself (required for the CDF-based watermark read to work at
+all, not inherited from `rss_bronze`); replaced the open-ended
+`TABLE_CHANGES(..., start+1)` call with an explicit bounded
+`[start_version + 1, end_version]` range to avoid a race where a commit
+landing mid-run gets nondeterministically included/excluded; added an
+explicit DBR ≥18.2 + serverless-only compute prerequisite for
+`ai_query`/`ai_classify`/`ai_extract` (a stricter, separate floor from
+Variant Shredding's DBR ≥17.2); pinned `ai_classify` to
+`version: '2.0'` + `multilabel: 'true'` and `ai_extract` to
+`version: '2.0'` explicitly (v2.1's changed per-field return shape would
+otherwise silently break every `result:response:...` access in this
+plan); softened the GitHub-token-minting design in Part A step 3 to
+present both real options rather than implying one was already chosen;
+and added the same "scaffolding parallel, grant-application dependent"
+caveat from Build Plan 00's §6 to this plan's Part A/B/D fan-out
+description.
