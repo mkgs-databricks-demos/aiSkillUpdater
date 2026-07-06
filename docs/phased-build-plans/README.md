@@ -1,17 +1,17 @@
-# Session Plans
+# Build Plans
 
 This folder breaks `docs/PROJECT-PLAN.md` into **self-contained, buildable
-session plans** — one per project phase. Each file is written to be handed
+build plans** — one per project phase. Each file is written to be handed
 to a coding agent (human-supervised) as its complete brief for that phase:
 objective, prerequisites, bundle placement, a numbered task breakdown, data
 contracts, an explicit fan-out map (what can run in parallel vs. what must
 be sequential — both *within* the plan and *across* plans), a validation
 checklist, and acceptance criteria.
 
-Every session plan assumes the reader has **not** read `PROJECT-PLAN.md` —
+Every build plan assumes the reader has **not** read `PROJECT-PLAN.md` —
 it restates whatever context it needs — but links back to the relevant
 `PROJECT-PLAN.md` section(s) for the full design rationale and history of
-decisions, rather than re-litigating *why* in the session plan itself.
+decisions, rather than re-litigating *why* in the build plan itself.
 
 Each plan was drafted from the locked decisions in `PROJECT-PLAN.md` (all
 open questions resolved as of this writing) and then **cross-reviewed** by
@@ -19,7 +19,7 @@ an independent sub-agent lens before being marked ready.
 
 ## Status
 
-| # | Session plan | Phase(s) covered | Status |
+| # | Build plan | Phase(s) covered | Status |
 |---|---------------|-------------------|--------|
 | 00 | [`00-workspace-setup-and-repo-configuration.md`](00-workspace-setup-and-repo-configuration.md) | Phase 0 | Cross-reviewed (codex + pi) |
 | 01 | `01-rss-ingestion-and-research-agent.md` | Phase 2 | Not started |

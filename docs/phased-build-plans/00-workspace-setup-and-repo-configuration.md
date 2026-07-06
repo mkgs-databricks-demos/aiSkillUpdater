@@ -1,4 +1,4 @@
-# Session Plan 00 — Workspace Setup / Repo Configuration (Phase 0)
+# Build Plan 00 — Phase 0: Workspace Setup / Repo Configuration
 
 **Source of truth:** `docs/PROJECT-PLAN.md` §1a, §1c, §1d, §3, §4, §5, Phase 0
 section. This plan restates what's needed to build Phase 0; it does not
@@ -35,7 +35,7 @@ per-installation onboarding flow that lets a Databricks App:
 5. Deploy the `-infra` → `-app` bundle sequence for the first time,
    proving the deploy-order/start-the-App plumbing end-to-end. **The
    `-ai-tools` bundle does not exist yet in this phase** (it's introduced
-   in Session Plans 01/03) — Phase 0 only proves two of the eventual
+   in Build Plans 01/03) — Phase 0 only proves two of the eventual
    three bundles' ordering; see §3 and §9 item 1.
 
 Everything in this phase is plumbing — no RSS ingestion, no research
@@ -46,7 +46,7 @@ its public host.
 
 ## 2. Prerequisites
 
-- None from other session plans — this is the first phase built.
+- None from other build plans — this is the first phase built.
 - External: a GitHub organization/account where the one-time GitHub App
   registration will live. **This is a repo-owner decision, not an
   engineering task — confirm it before any Part A work starts** (see the
@@ -72,7 +72,7 @@ its public host.
 
 `-ai-tools` does not exist in this phase at all — nothing in Phase 0
 depends on Vector Search or Genie, and attempting to deploy it before
-Session Plan 01/03 land is expected to fail by design (see §9 item 1).
+Build Plan 01/03 land is expected to fail by design (see §9 item 1).
 Confirm the `-infra` bundle's schema/volume declarations are scoped
 generically enough that Phase 1/Phase 2/Phase 2b can add their own
 tables/volumes to the *same* `-infra` bundle later without restructuring
@@ -87,7 +87,7 @@ service principal on first deploy — see the deploy-first ownership
 pitfall in §7). The schema/migration mechanism is an implementation
 choice (raw SQL migration files, Alembic, or the chosen framework's own
 migration tool) — whichever is picked, **record it here once decided**
-(see §10), because Session Plans 01 (RSS cursor table), 04 (review-queue
+(see §10), because Build Plans 01 (RSS cursor table), 04 (review-queue
 state), and 06 (version-tracking projection) add tables to this same
 schema and must reuse the same migration mechanism rather than each
 picking their own.
@@ -112,9 +112,9 @@ this one row at each step, never across the GitHub API calls in between.
 | `github_account_login` | text, nullable | The org/user login GitHub reports the app was installed on — useful for the settings screen and audit |
 | `github_repo_owner` | text, nullable | Resolved via the GitHub API (see §5 step 7a) — not assumed to be directly present in the callback params |
 | `github_repo_name` | text, nullable | Same as above |
-| `default_branch` | text, nullable | Resolved alongside repo owner/name; needed later by Session Plan 04's PR-open flow |
+| `default_branch` | text, nullable | Resolved alongside repo owner/name; needed later by Build Plan 04's PR-open flow |
 | `starting_point` | enum(`scratch`, `starter_pack`), nullable | |
-| `starter_pack_id` | FK → `starter_packs.pack_id`, nullable | Set only when `starting_point = starter_pack`. Because this is a live FK (not a copied snapshot), `PROJECT-PLAN.md` §1a's "starter packs stay live reference sources" requirement is satisfied automatically — Session Plan 04's "check for latest from Matt's version" always resolves this installation's pack row for current `source_repo`/`source_ref`, no separate per-installation snapshot table needed. |
+| `starter_pack_id` | FK → `starter_packs.pack_id`, nullable | Set only when `starting_point = starter_pack`. Because this is a live FK (not a copied snapshot), `PROJECT-PLAN.md` §1a's "starter packs stay live reference sources" requirement is satisfied automatically — Build Plan 04's "check for latest from Matt's version" always resolves this installation's pack row for current `source_repo`/`source_ref`, no separate per-installation snapshot table needed. |
 | `last_error` | text, nullable | Set when `status = failed`; cleared on successful retry |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -261,7 +261,7 @@ completing first. See §6 for how this is reflected in the fan-out map.
    its first commit (implementation detail: either a server-side git
    clone+push using the freshly-minted installation token, or an initial
    PR — pick whichever is simpler given the chosen App framework, note
-   the choice in §10 since Session Plan 04 should be consistent about
+   the choice in §10 since Build Plan 04 should be consistent about
    whether *all* repo writes go through PRs or this first-commit case is
    a deliberate exception). If "scratch" is chosen, take no repo action
    at all — the repo stays exactly as GitHub created it. Update
@@ -322,7 +322,7 @@ completing first. See §6 for how this is reflected in the fan-out map.
     changed any App-side config.
 17. Document (in this repo, e.g. a `docs/DEPLOY.md` or inline in each
     bundle's README) that `-ai-tools` does not exist yet and deploying it
-    before Session Plan 01/03 land will fail by design.
+    before Build Plan 01/03 land will fail by design.
 
 ## 6. Explicit fan-out map
 
@@ -372,7 +372,7 @@ completing first. See §6 for how this is reflected in the fan-out map.
 - Part C's step 16 (deploy-order script) depends on both step 14
   (including 14a) and step 15 existing.
 
-**Cross-plan fan-out:** Session Plans 01 (RSS ingestion) and 02
+**Cross-plan fan-out:** Build Plans 01 (RSS ingestion) and 02
 (grounding corpus) **can** start adding their own tables/volumes to the
 same shared `-infra` bundle in parallel with this phase's later steps,
 once §4's schema and §3's bundle skeleton exist — they add to the
@@ -456,28 +456,28 @@ own the file and the others submit patches to review before merging.
    install-picker — both by GitHub's design, not something this project
    can eliminate).
 3. Cloud + region selections are queryable from Lakebase and are the
-   values Session Plan 01 (RSS ingestion) will read to decide which
+   values Build Plan 01 (RSS ingestion) will read to decide which
    feeds to poll.
 4. The starter-pack registry has exactly one row ("Matt's version")
    pointing at this repo, and adding a second pack later requires only a
    row insert (confirm this by manually inserting a dummy second row in
    testing and verifying it appears as a second choice in the UI without
    a code change).
-5. This session plan's own validation checklist (§8) passes.
+5. This build plan's own validation checklist (§8) passes.
 
 ## 10. Open items carried forward (not blockers, tracked for later plans)
 
 - **App framework choice** (AppKit/React vs. a Python framework) — must
   be decided before Part B's components can be meaningfully parallelized
   (§6 precondition). Record the choice and resulting file layout here
-  once made, since Session Plans 03/04/05 build on top of it.
+  once made, since Build Plans 03/04/05 build on top of it.
 - **Schema/migration mechanism** (§4) — raw SQL migration files, Alembic,
   or the chosen framework's own tool. Record the choice here once made;
-  Session Plans 01/04/06 must reuse it rather than each picking their
+  Build Plans 01/04/06 must reuse it rather than each picking their
   own.
 - **Starting-point commit mechanism** (§5 step 9) — direct push vs. an
   opened PR for the starter-pack seed commit. Record whichever is chosen,
-  and confirm Session Plan 04 (Review App) is consistent about whether
+  and confirm Build Plan 04 (Review App) is consistent about whether
   *all* repo writes go through PRs or this first-commit case is a
   deliberate, documented exception.
 - **Webhook events** (§5 step 1a) — this plan assumes no webhook events
