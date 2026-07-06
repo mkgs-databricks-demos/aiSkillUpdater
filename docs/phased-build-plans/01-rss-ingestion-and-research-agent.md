@@ -529,6 +529,20 @@ profile.
     AWS-tracked regions (§1b) — skip the call entirely for non-AWS
     regions rather than asking the model and getting a meaningless
     answer.
+    **`ai_prep_search` considered, not used here (investigated,
+    two independent lenses)** — it's a real Beta AI Function
+    (`ai_prep_search(parsed, [options])`) that chunks and
+    context-enriches text for embedding, but its hard input contract is
+    **`ai_parse_document`'s VARIANT output only** (binary document files:
+    PDF/DOC/DOCX/PPT/PPTX/images). This step's inputs (live-fetched HTML
+    announcement pages, the `research_log` row itself) are neither
+    binary documents nor `ai_parse_document` output, so `ai_prep_search`
+    doesn't apply to the Research Agent or to `research_log`'s own
+    Vector Search index — each `research_log` row stays the retrieval
+    unit, prepared with plain string concatenation (title/summary/
+    classification/skill metadata), not `ai_prep_search`. See
+    `PROJECT-PLAN.md` §"Phase 1" for the one place `ai_prep_search`
+    could genuinely fit (a future document-file-based docs corpus).
 17. **Draft a proposed diff per classified skill/bucket** — a unified
     diff against the skill's current `SKILL.md`/references content
     (fetched via the same GitHub App token as step 15/Part A step 3) for
@@ -809,3 +823,11 @@ present both real options rather than implying one was already chosen;
 and added the same "scaffolding parallel, grant-application dependent"
 caveat from Build Plan 00's §6 to this plan's Part A/B/D fan-out
 description.
+
+**Post-review addendum:** investigated (two independent lenses) whether
+`ai_prep_search` should be used in this plan's pipeline. Confirmed real
+(Beta, DBR 18.2+) but its input contract is `ai_parse_document` output
+only (binary document files) — doesn't fit Part F's live-fetched-HTML/
+tabular inputs, so not adopted here. Noted in §5 step 16 and cross-linked
+to `PROJECT-PLAN.md`'s Phase 1 note, which flags it as the right tool
+*if* a future document-file-based docs corpus is added.

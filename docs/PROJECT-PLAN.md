@@ -599,6 +599,31 @@ which is what DAB targets are for.
   announcement — the Research Agent always does a live fetch of the
   announcement's own links first (Phase 2). This corpus just gives it
   broader context for the surrounding docs area.
+- **`ai_prep_search` considered — not adopted as designed (investigated,
+  two independent lenses).** `ai_prep_search(parsed, [options])` is a real
+  Databricks SQL/AI Function (Beta, DBR 18.2+, serverless env v3+,
+  Python/SQL only) that turns **`ai_parse_document`'s output** into
+  semantically-chunked, context-enriched, embedding-ready text
+  (`chunk_to_embed`/`chunk_to_retrieve`), explicitly documented as the
+  chunking stage ahead of a Vector Search (now "Databricks AI Search")
+  Delta Sync index — i.e. it's meant to *replace* manual chunking.
+  Its hard input contract is `ai_parse_document` output only (PDF, JPG/
+  JPEG, PNG, TIFF, DOC/DOCX, PPT/PPTX; ≤500 pages/≤100MB) — other VARIANT
+  shapes error or behave unexpectedly. This corpus is scraped
+  `docs.databricks.com` **HTML pages**, not binary document files run
+  through `ai_parse_document`, so `ai_prep_search` doesn't fit the
+  ingestion path *as currently designed* without an artificial
+  HTML→PDF conversion detour that isn't worth the complexity. Revisit
+  only if this corpus's source ever shifts to genuine document files
+  (e.g. ingesting downloadable Databricks whitepapers/PDF guides
+  alongside/instead of scraped HTML) — at that point `ai_prep_search`
+  is the right tool and should replace whatever ad hoc chunking Build
+  Plan 02 lands on. Also confirmed **not** applicable to `research_log`
+  (Phase 2/Build Plan 01) for the same reason — see that plan's own
+  note. (One side finding worth recording: the locally-installed
+  `databricks-ai-functions` skill doesn't mention `ai_prep_search` at
+  all — a live, concrete instance of exactly the staleness gap this
+  whole project exists to catch.)
 - **DAB bundling notes (cross-reviewed vs. `databricks-dabs`)**, relevant
   to Phase 1 and Phase 2b alike: (a) UC Volume resources in the bundle
   need explicit **`grants`**/UC privileges (e.g. `READ_VOLUME`, write
