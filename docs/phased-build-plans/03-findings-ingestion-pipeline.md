@@ -8,9 +8,10 @@ needed to build Phase 2b; it does not re-litigate design decisions already
 locked there — if something here seems to conflict with `PROJECT-PLAN.md`,
 that file wins and this plan is stale.
 
-**Cross-reviewed:** _pending._ A first draft; independent structural (`pi`)
-and Databricks-mechanics (`codex`) passes will fold in before this is marked
-ready.
+**Cross-reviewed:** an independent structural pass (`pi`) and an independent
+Databricks-mechanics fact-check pass (`codex`) both reviewed a first draft of
+this plan; every BLOCKING finding from both is folded into the version below.
+See the changelog at the bottom of this file.
 
 **What this phase is, in one sentence:** a Lakeflow Spark Declarative
 Pipeline (streaming, Autoloader) that watches the JSON findings UC Volume the
@@ -33,14 +34,14 @@ Phase 2b.
 > `research_log` silver → a TRIGGERED Delta Sync index that gets
 > `sync_index()`'d after each batch) but leaves several *hows* open. This plan
 > makes explicit, flagged choices for: the `research_log` **row-identity /
-> primary-key scheme** (§4, §10 #1); **what triggers the pipeline** (§5 Part
-> E, §10 #2); **where `sync_index()` actually runs** — which is *not* inside
+> primary-key scheme** (§4, §11 #1); **what triggers the pipeline** (§5 Part
+> E, §11 #2); **where `sync_index()` actually runs** — which is *not* inside
 > the LDP, for the same declarative-side-effect reason that killed the earlier
-> `ForEachBatch Sink` idea (§5 Part D, §7, §10 #3); the **explode-and-upsert
-> mechanism** (AUTO CDC / `apply_changes` keyed on the row id vs. plain append
-> — §5 Part C, §10 #4); and **which nested fields are stored as `VARIANT`**
-> vs. typed columns (§4, §10 #5). Each discretionary choice is consolidated in
-> §10 for the repo owner and cross-review to confirm or override.
+> `ForEachBatch Sink` idea (§5 Part C step 7 / Part E, §7, §11 #3); the
+> **explode-and-upsert mechanism** (AUTO CDC via `create_auto_cdc_flow()` keyed
+> on the row id vs. plain append — §5 Part C, §11 #4); and **which nested fields are stored as `VARIANT`**
+> vs. typed columns (§4, §11 #5). Each discretionary choice is consolidated in
+> §11 for the repo owner and cross-review to confirm or override.
 
 ---
 
@@ -100,13 +101,15 @@ Explicit non-goals (owned by other plans):
   endpoint + docs-corpus index). This plan adds the `research_log` index to
   it.
 - **DBR / runtime floor:** the pipeline runs on serverless Lakeflow Declarative
-  Pipeline compute. If any `VARIANT` columns use variant shredding (§4, §10
+  Pipeline compute. If any `VARIANT` columns use variant shredding (§4, §11
   #5), the DBR ≥ 17.2 + workspace Previews-toggle floor from `PROJECT-PLAN.md`
   §2 Phase 2 applies — confirm the pipeline's runtime satisfies it, or drop
   shredding for the first cut.
-- **Build order:** per `PROJECT-PLAN.md` §4, Phase 2b is built after Phase 2
-  (Build Plan 01) and Phase 1 (Build Plan 02). It has no dependents that can't
-  wait: Build Plan 04 (Review App) needs `research_log` to have a handful of
+- **Build order:** `PROJECT-PLAN.md` §4's build-order list doesn't enumerate
+  Phase 2b explicitly, but it necessarily follows Phase 2 (Build Plan 01, which
+  produces the findings files this pipeline consumes) and Phase 1 (Build Plan
+  02, which creates the shared endpoint this index sits on). It has no
+  dependents that can't wait: Build Plan 04 (Review App) needs `research_log` to have a handful of
   real rows before it's worth building.
 
 ---
@@ -159,10 +162,12 @@ Phase 2b in isolation has the exact shape:
 
 Contract facts this pipeline must honor (all inherited from Build Plan 01 §4):
 
-- **One file per RSS entry**, named/laid out per Build Plan 01 Part B step 5:
-  `/Volumes/main/<schema>/research_findings/<installation_id>/<rss_guid_hash>.json`
-  (confirm the exact convention against Build Plan 01's §10 once it's frozen).
-  Autoloader globs the whole `research_findings/**` tree.
+- **One file per RSS entry.** Build Plan 01's Part B step 5 gives this as the
+  **proposed/example** layout, still listed as an open item in its §10 (not yet
+  frozen):
+  `/Volumes/main/<schema>/research_findings/<installation_id>/<rss_guid_hash>.json`.
+  Confirm the exact convention against Build Plan 01's §10 before wiring the
+  Autoloader glob; Autoloader then globs the whole `research_findings/**` tree.
 - **`skill_classifications` is an array** — the silver transform explodes it,
   so one file becomes N `research_log` rows (N ≥ 1; a "New Feature" entry may
   have exactly one classification with `target_skill_path: null`).
@@ -172,7 +177,7 @@ Contract facts this pipeline must honor (all inherited from Build Plan 01 §4):
   inconsistent column type across files. Compliance is keyed by **dynamic
   region names** (only this installation's tracked regions appear) — that
   dynamic-key shape is the main reason `availability` is a `VARIANT`/map, not
-  a fixed struct (§4, §10 #5).
+  a fixed struct (§4, §11 #5).
 - **`schema_version`** exists so this pipeline can branch on shape later; the
   bronze table must keep it as a first-class column and the pipeline should
   assert/route on it rather than silently assuming `"1"`.
@@ -185,7 +190,19 @@ Contract facts this pipeline must honor (all inherited from Build Plan 01 §4):
 
 ---
 
-## 4. Data model
+## 4. Bundle placement & data model
+
+### Bundle placement (per `PROJECT-PLAN.md` §1d)
+
+| Resource | Bundle | Notes |
+|---|---|---|
+| `research_findings_bronze` (Delta) | `-infra` | Autoloader landing table (§5 Part B). |
+| `research_log` (Delta) | `-infra` | Silver system of record; the VS index's source. Stays in Delta, **not** Lakebase (§1c). |
+| Findings-ingestion pipeline (modern SDP / LDP) | `-infra` | Per §1d, the findings-ingestion pipeline "through `research_log`" is listed under `-infra` (§5 Parts A–C). |
+| `research_log` Delta Sync VS index | `-ai-tools` | On the **shared** Storage-Optimized endpoint (§5 Part D). Per §1d both indexes live in `-ai-tools`. |
+| Shared Storage-Optimized VS **endpoint** | `-ai-tools` (created by **Build Plan 02**) | **NOT created here** — referenced (§6). |
+| `sync_index()` orchestration Job task | `-infra` | Runs the pipeline, then syncs the index after the batch lands (§5 Part E). |
+| App SP `SELECT` on `research_log` | `-infra` | For Build Plan 04's review-queue reads (access path decided in Build Plan 04). |
 
 ### Delta / Unity Catalog (new in this plan, both in `-infra`)
 
@@ -197,7 +214,7 @@ ingested file. Autoloader target.
 | `_source_file` | `STRING` | `_metadata.file_path` — the Volume path of the file this row came from. Natural dedup/debug key. |
 | `_ingested_at` | `TIMESTAMP` | Autoloader ingest time. |
 | `schema_version` | `STRING` | Lifted to top level for cheap routing/asserts. |
-| `payload` | `VARIANT` | The full parsed JSON object (see §10 #5 — `VARIANT` vs. an inferred struct). |
+| `payload` | `VARIANT` | The full parsed JSON object (see §11 #5 — `VARIANT` vs. an inferred struct). |
 | `_rescued_data` | `STRING` | Autoloader rescued-data column for anything off-schema; a non-null value here is an observability signal (Build Plan 07), not a silent drop. |
 
 **`research_log`** — silver, **one row per (RSS entry × classification
@@ -205,7 +222,7 @@ label)**. System of record for Build Plan 04 / Phase 4. Stays in Delta (§1c).
 
 | Column | Type | Notes |
 |---|---|---|
-| `research_log_id` | `STRING` (PK) | **Deterministic, content-addressed** (§10 #1): `rl_` + a stable short hash of (`installation_id`, `rss_guid`, `label`). Stable across re-ingestion → idempotent upsert + a stable Vector Search primary key. See §10 #1 for the reconciliation with §5's `last_research_log_id` display format. |
+| `research_log_id` | `STRING` (PK) | **Deterministic, content-addressed** (§11 #1): `rl_` + a stable short hash of (`installation_id`, `rss_guid`, `label`). Stable across re-ingestion → idempotent upsert + a stable Vector Search primary key. See §11 #1 for the reconciliation with §5's `last_research_log_id` display format. |
 | `installation_id` | `STRING` | From the file. |
 | `research_agent_run_id` | `STRING` | From the file. |
 | `rss_guid` | `STRING` | `rss_entry.guid`. |
@@ -220,7 +237,7 @@ label)**. System of record for Build Plan 04 / Phase 4. Stays in Delta (§1c).
 | `target_skill_path` | `STRING` (nullable) | `null` for New Feature / new bucket. |
 | `proposed_diff` | `STRING` (nullable) | Unified diff, or drafted new-file content, or null. |
 | `citations` | `VARIANT` | Array of `{id, url, title}`; read by the review card's footnotes. |
-| `availability` | `VARIANT` | `{clouds[], compliance{...}}` with dynamic region keys — `VARIANT`/map, not a fixed struct (§10 #5). Tri-state stays string. |
+| `availability` | `VARIANT` | `{clouds[], compliance{...}}` with dynamic region keys — `VARIANT`/map, not a fixed struct (§11 #5). Tri-state stays string. |
 | `errors` | `VARIANT` | Carried through from the file (may be empty array). |
 | `status` | `STRING` | From the file (`"pending_review"` at ingest). **Read-only lineage of the finding's origin — NOT the review decision.** The accept/reject/edit click-state is Lakebase-owned (§1c) and never written back here. |
 | `schema_version` | `STRING` | Propagated from bronze. |
@@ -238,7 +255,7 @@ pipeline's runtime):
 - `delta.enableRowTracking = true` and `CLUSTER BY AUTO` — consistent with the
   project's table conventions (§ `rss_bronze` in `PROJECT-PLAN.md` §2). If any
   `VARIANT` column uses variant shredding, add `delta.enableVariantShredding`
-  and satisfy the DBR ≥ 17.2 floor (§10 #5).
+  and satisfy the DBR ≥ 17.2 floor (§11 #5).
 
 ### Vector Search — `research_log` index (`-ai-tools`)
 
@@ -266,7 +283,7 @@ pipeline's runtime):
 **None new in this plan.** `research_log` stays in Delta (§1c). The only
 Lakebase interaction Phase 2b touches indirectly is that Build Plan 04's
 review-queue state will reference `research_log_id` as a foreign key — which
-is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
+is exactly why §11 #1 (a *stable* `research_log_id`) matters across plans.
 
 ---
 
@@ -286,13 +303,15 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
 ### Part B — Bronze flow: Autoloader JSON → `research_findings_bronze` (`-infra`)
 
 2. **Autoloader (`cloudFiles`, format `json`) streaming read** of the findings
-   Volume glob (`/Volumes/.../research_findings/**`, exact path per Build Plan
-   01's frozen convention). Configure:
-   - A **schema location** for Autoloader's schema tracking, and
-     **`schemaHints`** pinning the known top-level shape (esp. the compliance
+   Volume glob (`/Volumes/.../research_findings/**`, example path — Build Plan
+   01's exact layout is not yet frozen, see §3). Configure:
+   - **`schemaHints`** pinning the known top-level shape (esp. the compliance
      tri-state as `STRING`, and `skill_classifications` as an array) so
      inference can't flip a column type across files where some entries are
-     `"unknown"` and others `"true"`/`"false"`.
+     `"unknown"` and others `"true"`/`"false"`. **Do not set
+     `cloudFiles.schemaLocation` manually** — inside an SDP/LDP pipeline the
+     schema location and checkpoint are managed automatically; `schemaHints`
+     is your only typing lever.
    - **`_rescued_data`** enabled — off-schema content is captured, not dropped.
    - **`cloudFiles.schemaEvolutionMode`** chosen deliberately (default
      `addNewColumns` vs. `rescue`) — record the choice; a schema change should
@@ -300,16 +319,19 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
      crash.
 3. Write raw rows to `research_findings_bronze` with `_source_file`
    (`_metadata.file_path`), `_ingested_at`, `schema_version` lifted to top
-   level, and the full object in `payload` (`VARIANT` — see §10 #5).
+   level, and the full object in `payload` (`VARIANT` — see §11 #5).
 4. **Idempotency of file ingestion:** Autoloader's checkpoint tracks
-   already-seen files exactly-once. Decide and record behavior for a
-   **re-written file** (same `<rss_guid_hash>.json` overwritten by a
-   corrected re-run): default Autoloader may **not** re-ingest an overwritten
-   path. If corrections must flow, either set `cloudFiles.allowOverwrites` or
-   rely on the deterministic `research_log_id` upsert (Part C) to make a
-   re-ingested file converge rather than duplicate. Cross-check against Build
-   Plan 01's watermark design, which normally prevents re-processing the same
-   `rss_silver` row at all (§10 #4).
+   already-seen files exactly-once. Behavior for a **re-written file** (same
+   `<rss_guid_hash>.json` overwritten by a corrected re-run): default Autoloader
+   does **not** re-ingest an overwritten same-path file — so `allowOverwrites`
+   and the deterministic-id upsert are **not** an either/or. To make a
+   correction flow at all you must either set `cloudFiles.allowOverwrites`
+   **or** write it under a new/versioned filename; the deterministic
+   `research_log_id` upsert (Part C) then makes the re-ingested content
+   **converge** (update in place, no duplicate) — but the upsert alone cannot
+   make Autoloader *notice* an overwrite. In practice Build Plan 01's watermark
+   normally prevents re-processing the same `rss_silver` row at all, so
+   corrections are the exception, not the rule (§11 #6).
 
 ### Part C — Silver flow: explode → `research_log` (`-infra`)
 
@@ -320,17 +342,18 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
      `is_new_feature_bucket`, `target_skill_path`, `availability`,
      `proposed_diff`.
    - Compute `research_log_id = 'rl_' || sha2(concat_ws(':', installation_id,
-     rss_guid, label), 256)` (short-hashed — §10 #1). Deterministic → the same
+     rss_guid, label), 256)` (short-hashed — §11 #1). Deterministic → the same
      finding re-ingested produces the same id.
    - Keep compliance strings **as strings**; keep `citations`/`availability`/
-     `errors` as `VARIANT` (§10 #5).
-6. **Upsert semantics (primary design — §10 #4):** land into `research_log`
-   via LDP **AUTO CDC / `apply_changes`** (SCD type 1) keyed on
-   `research_log_id`, so a re-ingested or corrected finding **updates in place**
-   rather than duplicating. Sequence by `processed_at` (or `_ingested_at`) so
+     `errors` as `VARIANT` (§11 #5).
+6. **Upsert semantics (primary design — §11 #4):** land into `research_log`
+   via LDP **AUTO CDC (`create_auto_cdc_flow()`)** (SCD type 1) keyed on
+   `research_log_id`, against a **pre-created streaming-table target**, so a
+   re-ingested or corrected finding **updates in place** rather than
+   duplicating. Sequence by `processed_at` (or `_ingested_at`) so
    the latest wins. Alternative if AUTO CDC proves unnecessary: a plain
    append streaming table, relying on Build Plan 01's watermark to guarantee
-   one-file-per-entry and thus no dupes — recorded as the fallback in §10 #4.
+   one-file-per-entry and thus no dupes — recorded as the fallback in §11 #4.
 7. **`sync_index()` is NOT called from inside this pipeline.** An LDP dataset
    function returns a DataFrame; it has no sanctioned way to perform the
    external Vector Search API side-effect mid-flow — this is the *same*
@@ -354,7 +377,7 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
 
 ### Part E — Orchestration: run the pipeline, then sync the index (`-infra` job + `-ai-tools` index)
 
-10. **What triggers the pipeline (§10 #2).** Primary proposal: make the
+10. **What triggers the pipeline (§11 #2).** Primary proposal: make the
     findings-ingestion pipeline a **downstream task of the Research Agent Job**
     (Build Plan 01) — the agent writes all findings files (its Part F step
     20), then a dependent task runs this pipeline (`availableNow`-style
@@ -393,7 +416,7 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
   (through the Apps Data Access Decision Gate — warehouse Analytics by
   default, optional Lakebase synced-table mirror if too slow, per
   `PROJECT-PLAN.md` §2 Phase 3). Build Plan 04's review-queue CRUD state keys
-  on `research_log_id` — so **`research_log_id` must be stable** (§10 #1). The
+  on `research_log_id` — so **`research_log_id` must be stable** (§11 #1). The
   interface is just "the `research_log` schema + a stable id" — no code
   coupling.
 - **Consumer: Build Plan 08 (Phase 6, stretch).** The KB search UI / MCP
@@ -405,18 +428,19 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
   its `rss_silver_watermark` only after all findings files for a run are
   written (its Part F step 20). This plan should be able to assume a run's
   files are complete when it fires — relevant to the trigger choice (§5 Part
-  E / §10 #2).
+  E / §11 #2).
 
 ---
 
 ## 7. Platform constraints to build against (to be cross-review-confirmed)
 
 - **LDP cannot perform the Vector Search side-effect.** A declarative dataset
-  function returns a DataFrame; it has no sanctioned external-write hook, and
-  the one streaming external-write mechanism (a `Sink`) is append-only, not an
-  index API call. This is why `sync_index()` is an orchestration step, not a
-  pipeline step (§5 Part C step 7 / Part E) — and why the earlier
-  `ForEachBatch Sink` design was rejected (`PROJECT-PLAN.md` §2 Phase 2b).
+  function must be declarative and return a DataFrame — it has no sanctioned
+  hook for an external index API call mid-flow. So a `TRIGGERED` Delta Sync
+  index is synced by **orchestration after the pipeline completes**, not from
+  inside a pipeline step (§5 Part C step 7 / Part E). This is the same reasoning
+  that led `PROJECT-PLAN.md` §2 Phase 2b to reject the `ForEachBatch Sink`
+  idea.
 - **`TRIGGERED` Delta Sync index requires an explicit sync call** after each
   batch — it does not sync on every table change automatically. Confirm the
   current API/operation name (Vector Search → AI Search rename).
@@ -428,12 +452,15 @@ is exactly why §10 #1 (a *stable* `research_log_id`) matters across plans.
   skill (same finding as Build Plan 02 §7).
 - **Autoloader schema inference across mixed files** can flip a column's type
   when some files carry `"unknown"` and others `"true"`/`"false"` — pinned
-  `schemaHints` + the string-enum contract (§3) prevent this. Keep a schema
-  location so inference is stable across restarts.
+  `schemaHints` + the string-enum contract (§3) prevent this. In an SDP
+  pipeline the schema location/checkpoint are managed automatically — rely on
+  `schemaHints`, not a manually-set `cloudFiles.schemaLocation`, for stable
+  typing.
 - **`explode` in a streaming flow** is a stateless transform — valid in a
-  streaming table. AUTO CDC / `apply_changes` (§5 Part C step 6) requires the
-  target to be a streaming table declared in the pipeline; confirm the modern
-  `pyspark.pipelines` API surface for it (not the legacy `dlt.apply_changes`).
+  streaming table. AUTO CDC via **`create_auto_cdc_flow()`** (§5 Part C step 6)
+  requires a **pre-created streaming-table target** plus keys, sequencing, and
+  an SCD type; use the modern `pyspark.pipelines` API — **not** legacy
+  `dlt.apply_changes`.
 - **`VARIANT` metadata columns in a Vector Search index** may not be syncable —
   scoping `columns_to_sync` to scalars (§4) sidesteps this; confirm before
   adding any `VARIANT` to the index.
@@ -512,7 +539,35 @@ not just unit tests:
 
 ---
 
-## 10. Open items carried forward (decisions to confirm in cross-review)
+## 10. Acceptance criteria (Definition of Done)
+
+- [ ] Both bundles validate: the bronze + `research_log` tables and the
+      findings-ingestion pipeline are declared in `-infra`, and the
+      `research_log` Delta Sync index in `-ai-tools`, all as bundle resources;
+      `databricks bundle validate` passes for each.
+- [ ] A real findings file dropped into the Volume yields the correct exploded
+      `research_log` rows (one per `skill_classifications` entry), with the
+      compliance tri-state preserved **as strings** and `citations` /
+      `availability` intact.
+- [ ] `research_log_id` is deterministic: re-ingesting a corrected file
+      **upserts in place** (no duplicate row) — per the re-ingest mechanics in
+      §5 Part B step 4 / §11 #6.
+- [ ] The `research_log` index is created on the **shared** endpoint (no second
+      endpoint) using the **same pinned embedding endpoint** as the docs-corpus
+      index, and a HYBRID query returns a newly-ingested row with its
+      `label` / `rss_link` metadata.
+- [ ] `sync_index()` runs as an orchestration step **after** the pipeline
+      update (not inside the LDP), is idempotent, and a zero-new-row run is a
+      safe no-op.
+- [ ] A malformed / off-schema file is rescued (not silently dropped) and does
+      **not** crash the batch; a populated `errors` array does not reject the
+      row.
+- [ ] The JSON / file-layout contract consumed here matches Build Plan 01 §4 +
+      its file-layout convention exactly (§3).
+
+---
+
+## 11. Open items carried forward (decisions to confirm in cross-review)
 
 1. **`research_log_id` scheme (primary design: deterministic content-hash).**
    `rl_` + `sha2(installation_id:rss_guid:label)` gives stable idempotent
@@ -532,8 +587,8 @@ not just unit tests:
    the pipeline update, **not** inside the LDP (the declarative-side-effect
    constraint that killed `ForEachBatch Sink`). Confirm this is the idiomatic
    pattern and that there's no supported post-flow hook that would be cleaner.
-4. **Explode-and-upsert mechanism.** Primary: AUTO CDC / `apply_changes` (SCD
-   1) keyed on `research_log_id` for idempotent in-place updates. Fallback: a
+4. **Explode-and-upsert mechanism.** Primary: AUTO CDC
+   (`create_auto_cdc_flow()`, SCD 1) keyed on `research_log_id` for idempotent in-place updates. Fallback: a
    plain append streaming table relying on Build Plan 01's watermark to
    guarantee one-file-per-entry. Confirm AUTO CDC is worth the complexity vs.
    append given the watermark already prevents most re-processing.
@@ -551,13 +606,51 @@ not just unit tests:
 
 ---
 
-## 11. Changelog
+## 12. Changelog
 
 - **Initial draft** (pre-cross-review): drafted from `PROJECT-PLAN.md` §2
   Phase 2b, §1c, §1d, §5, and the frozen contracts in Build Plan 01 §4
   (JSON findings schema) and Build Plan 02 §6 (shared endpoint + embedding
-  pin). Made explicit flagged decisions for the six open items in §10 that the
+  pin). Made explicit flagged decisions for the six open items in §11 that the
   source doc leaves open — most notably placing `sync_index()` in
   orchestration rather than inside the LDP (the same declarative-side-effect
   reason the `ForEachBatch Sink` was rejected), a deterministic content-hash
   `research_log_id`, and AUTO CDC upsert on that id.
+- **Cross-review fold-in (`codex` mechanics + `pi` structure).**
+  - **`codex` BLOCKING #1 — no manual `cloudFiles.schemaLocation` in an SDP
+    pipeline.** LDP manages the Auto Loader schema location + checkpoint
+    automatically; the draft required setting one. Removed it from §5 Part B
+    step 2 and §7; `schemaHints` is now stated as the only typing lever. (Not a
+    stale-skill divergence — matches current docs and the local skill.)
+  - **`codex` BLOCKING #2 — `allowOverwrites` vs. deterministic upsert is not
+    either/or.** The upsert only converges a file *once it is re-ingested*; it
+    can't make Auto Loader notice an overwritten same-path file. Rewrote §5
+    Part B step 4 (and §11 #6) so a correction requires `allowOverwrites` **or**
+    a new filename, with the deterministic id then de-duping.
+  - **`codex` NIT — modern `create_auto_cdc_flow()`.** Replaced the "AUTO CDC /
+    `apply_changes`" shorthand throughout (header callout, §5 Part C step 6, §7,
+    §11 #4) with the modern `pyspark.pipelines` `create_auto_cdc_flow()` against
+    a pre-created streaming-table target.
+  - **`codex` NIT — Sink rationale narrowed.** §7's first bullet no longer
+    leans on "the only external-write mechanism is an append-only Sink"; it now
+    states the accurate reason (dataset functions must be declarative and
+    return DataFrames; a `TRIGGERED` index is synced by orchestration after the
+    pipeline).
+  - **`codex` NIT — file layout not yet frozen.** §3 and §5 Part B step 2 now
+    present the `research_findings/**` path as Build Plan 01's proposed/example
+    layout (still open in its §10), not a frozen convention. (`codex` confirmed
+    the shared-endpoint, JSON-schema, `file_arrival`-on-Volumes, and
+    declarable-DAB-resource claims are all sound — no change.)
+  - **`pi` — header mis-citation.** The preamble callout cited "§5 Part D" for
+    where `sync_index()` runs; corrected to "§5 Part C step 7 / Part E" (Part D
+    declares the index).
+  - **`pi` — step-4 pointer.** Step 4's inline open-item pointer now resolves to
+    §11 #6 (its dedicated item), not #4.
+  - **`pi` — build-order over-claim.** §2 no longer says §4 "places" Phase 2b;
+    it states 2b follows Phase 2/Phase 1 by dependency, since §4's list doesn't
+    enumerate 2b.
+  - **`pi` — format parity.** Added a dedicated **Bundle placement** table (§4)
+    and an explicit **Acceptance criteria / Definition of Done** section (§10),
+    matching Build Plans 00/01/02; open items renumbered to §11, changelog to
+    §12. (`pi` found no numbering bug and verified §3's reproduced JSON matches
+    Build Plan 01 §4 byte-for-byte and all cross-file citations resolve.)
