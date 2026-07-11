@@ -73,16 +73,22 @@ it never writes to Delta directly and never touches a skill file.
   self-provision (no documented API for the Previews toggle).
 - **Separate, higher DBR/compute requirement for the Research Agent Job
   specifically (Part F only — does not apply to the polling Job, Part
-  C)**: `ai_query`, `ai_classify`, and `ai_extract` (as of this writing)
-  require DBR ≥ 18.2 and run only on **serverless** compute for
-  notebooks/workflows — they are not available on Pro or Classic SQL
-  warehouses. The Research Agent Job's task must be configured for
-  serverless compute with a DBR meeting that floor; confirm this is
-  compatible with whatever DBR the target workspace/bundle otherwise pins
-  before finalizing the task's compute config. Note this is a *higher*
-  floor than Variant Shredding's ≥17.2 above — meeting the AI Functions
-  floor automatically satisfies the Variant Shredding one, not the other
-  way around.
+  C)**: `ai_query`, `ai_classify`, and `ai_extract` require **DBR ≥ 18.2**
+  and run only on **serverless** compute for notebooks/workflows — they are
+  not available on Pro or Classic SQL warehouses. This floor was **verified
+  against live Databricks docs during cross-review** (all three functions'
+  Requirements sections state it verbatim as of Jun 2026). The
+  locally-installed `databricks-dbsql` skill still documents the older
+  ~15.1 / 15.4-LTS floor and the legacy v1 API shapes — **do not** downgrade
+  this plan to match it; it is stale on the AI Functions surface, a concrete
+  instance of exactly the staleness this whole project exists to catch.
+  Mechanically, a serverless task selects serverless by **omitting cluster
+  config** (per `databricks-jobs`), *not* by pinning a `spark_version`; the
+  serverless AI-Functions runtime provides the ≥18.2 requirement, and any
+  extra pip deps go in an `environments` block (`client: "4"`). Note this is
+  a *higher* floor than Variant Shredding's ≥17.2 above — meeting the AI
+  Functions floor automatically satisfies the Variant Shredding one, not the
+  other way around.
 
 ## 3. Bundle placement (per `PROJECT-PLAN.md` §1d)
 
@@ -306,7 +312,13 @@ This is the "idempotent processed/seen marker" `PROJECT-PLAN.md` §2 Phase
 per row (§5 Part E). Using a single watermark version (rather than a set
 of already-seen `guid`s) keeps this table's write pattern a plain
 single-row upsert per run, consistent with everything else's Lakebase
-profile.
+profile. Keep it a single-statement upsert — do **not** wrap the watermark
+advance plus findings writes in a SQL multi-statement transaction; per
+`databricks-dbsql` `references/sql-scripting.md`, multi-statement
+transactions / `BEGIN ATOMIC` are Preview and require `catalogManaged`,
+which this design avoids. The ordering guarantee (advance the watermark
+only after all findings files are written — Part F step 20) is enforced by
+task sequencing, not a DB transaction.
 
 ## 5. Task breakdown
 
@@ -386,16 +398,28 @@ profile.
       — a `304` on one feed and a `200` on another in the same run is
       normal, not an error.
    Runs on **serverless compute** (no compute-tier requirement for this
-   workload); schedule **daily** (an afternoon/evening-UTC time aligns
-   with typical `<lastBuildDate>` updates, per §2 Phase 2 — pick a
-   specific hour and record it here once chosen).
+   workload; per `databricks-jobs`, serverless is selected by omitting
+   cluster config, **not** by pinning a DBR version). Schedule **daily**
+   via a `schedule` block with all three fields `databricks-jobs` requires
+   together — `quartz_cron_expression`, `timezone_id`, and
+   `pause_status: UNPAUSED` (a missing/invalid timezone or a paused status
+   is a listed "schedule not triggering" cause) — e.g.
+   `quartz_cron_expression: "0 0 18 * * ?"`, `timezone_id: "UTC"`,
+   `pause_status: UNPAUSED`. An afternoon/evening-UTC hour aligns with
+   typical `<lastBuildDate>` updates (per §2 Phase 2); pick the specific
+   hour and record it in §10 once chosen.
 7. **Multi-installation note**: if this Job is meant to serve every
    installation from one deployed instance (vs. one Job per installation
    — confirm which model this deployment actually uses, since
    `PROJECT-PLAN.md`'s intro assumes multi-tenant capability but a given
    deployment may in practice run single-tenant), step 1 must loop over
    *all* installations' `tracked_clouds`, not just a single hardcoded one.
-   Record which model was actually built here once decided (see §10).
+   Record which model was actually built here once decided (see §10). If
+   the one-Job-serves-N-installations model is chosen, `databricks-jobs`'s
+   native `for_each_task` (loop over inputs with a `concurrency` cap,
+   inputs supplied from an upstream task via `dbutils.jobs.taskValues`) is
+   the idiomatic construct for the per-installation loop rather than
+   hand-rolled iteration.
 
 ### Part D — `rss_bronze` → `rss_silver` pipeline (`-infra`)
 
@@ -412,25 +436,46 @@ profile.
 9. This pipeline is the sole DLT-managed writer of `rss_silver` — nothing
    else ever writes to it directly (consistent with `rss_bronze` being
    the sole *reader* source, per the earlier LDP-vs-`http_request`
-   rejection already locked in `PROJECT-PLAN.md`).
+   rejection already locked in `PROJECT-PLAN.md`). Declare `rss_silver`
+   with `CLUSTER BY AUTO` as well — `databricks-dbsql`
+   `references/best-practices.md` recommends liquid clustering by default
+   for new Delta tables including streaming tables — and it needs CDF +
+   Row Tracking enabled on itself (§4) for Part F step 11's `table_changes`
+   read to work at all (those are not inherited from `rss_bronze`).
 
 ### Part E — Table update trigger (`-infra`)
 
 10. Configure the Research Agent Job's trigger:
     ```yaml
     trigger:
+      pause_status: UNPAUSED           # REQUIRED — sibling of table_update;
+                                       # omitting it is databricks-jobs'
+                                       # #1 listed "trigger not firing" cause
       table_update:
         table_names: ["main.<schema>.rss_silver"]
-        condition: ANY_UPDATED
+        condition: ANY_UPDATED         # only value databricks-jobs documents;
+                                       # do NOT use ALL_UPDATED without
+                                       # verifying it exists in the live SDK
+        min_time_between_triggers_seconds: 600
+        wait_after_last_change_seconds: 120
     ```
     per `PROJECT-PLAN.md` §2 Phase 2 / §6 #13 — a real, UC-table-scoped
     native Jobs trigger type, distinct from `file_arrival` (Volumes/
-    external locations only, never managed tables). Confirm the exact
-    current YAML/API shape (field names, whether debounce options are
-    available/needed) against `databricks-jobs` before finalizing —
-    `PROJECT-PLAN.md`'s investigation confirmed the trigger type exists
-    and its rough shape, not necessarily every field name verbatim as of
-    whatever CLI/SDK version this plan is actually implemented against.
+    external locations only, never managed tables). The `pause_status`
+    and both debounce fields above are documented for `table_update` in
+    `databricks-jobs` `references/triggers-schedules.md`
+    (`wait_after_last_change_seconds` lets several `rss_silver` commits
+    from one pipeline run coalesce into a single Research Agent run rather
+    than firing per-commit). Separately, on the Research Agent **Job**
+    (not the trigger block), set `max_concurrent_runs: 1` with
+    `queue: {enabled: true}`: per `databricks-jobs`, the default
+    `max_concurrent_runs: 1` with no queue silently **skips** any trigger
+    that fires while a run is active; enabling the queue runs them
+    sequentially instead (the watermark makes a dropped fire self-healing
+    only if a *later* commit ever arrives, so queueing is the safer
+    default). The `table_update` trigger exposes **no** payload (no commit
+    version/timestamp) — see step 11 for how this run's version bound is
+    obtained instead.
 
 ### Part F — Research Agent Job (`-infra`)
 
@@ -438,12 +483,15 @@ profile.
     assume one trigger firing maps to one new row. Read
     `rss_silver_watermark.last_processed_commit_version` for this
     installation (call it `start_version`); separately capture an
-    explicit `end_version` for this run — either the trigger payload's
-    own exposed commit version (if the trigger config exposes one
-    reliably; confirm against current Jobs trigger documentation) or, if
-    not, the table's latest committed version at the moment this step
-    runs (e.g. via `DESCRIBE HISTORY` or an equivalent version-lookup
-    call) captured *before* any further processing. Then call
+    explicit `end_version` for this run as the table's latest committed
+    version at the moment this step runs (e.g. via `DESCRIBE HISTORY` or
+    an equivalent version-lookup call), captured *before* any further
+    processing. The `table_update` trigger exposes **no** payload (no
+    commit version or timestamp) — `databricks-jobs`
+    `references/triggers-schedules.md` documents a trigger payload only
+    for `file_arrival`, never `table_update` — so this version lookup is
+    the only supported way to bound the run, not a fallback to a
+    payload value. Then call
     `table_changes('main.<schema>.rss_silver', start_version + 1,
     end_version)` — an explicit bounded `[start, end]` range, **not**
     an open-ended "start to latest" call — so that any `rss_silver` commit
@@ -479,11 +527,19 @@ profile.
     citation markers, and a parallel `citations` array of
     `{id, url, title}`. Structure the prompt/output contract so this is
     parseable into the JSON schema's `summary`/`citations` fields
-    directly, not free-text requiring a second parse.
+    directly, not free-text requiring a second parse. If relying on
+    `ai_query`'s structured `responseFormat`, note (per `databricks-dbsql`
+    `references/ai-functions.md`) that a top-level `responseFormat` STRUCT
+    must contain **exactly one** field — wrap the summary+citations pair in
+    a single top-level object (e.g. `STRUCT<result: STRUCT<summary ...,
+    citations ...>>`) rather than two top-level fields.
 15. **Classify with `ai_classify`**, explicitly pinned to
     `options => map('version', '2.0', 'multilabel', 'true', 'instructions', <taxonomy context>)`
     — the multilabel behavior, per-label descriptions, and up to
-    500-label capacity this plan relies on are v2-only; the older
+    500-label capacity this plan relies on are v2-only (verified against
+    live docs during cross-review — v2 returns an array with up to 500
+    labels; the `databricks-dbsql` skill still documents only the legacy
+    v1 single-label / 20-label `STRING` API and is stale here); the older
     default/v1 behavior has materially smaller limits and no multilabel
     mode. Build the label set fresh each run from the configured skills
     repo's current `SKILL.md` files (name + one-line description each),
@@ -515,7 +571,8 @@ profile.
     guidance); keep the schema within documented limits (≤128 fields,
     ≤7 nesting levels) by scoping to just this installation's tracked
     clouds/regions. **Pin `options => map('version', '2.0')` explicitly**
-    — current `ai_extract` v2.1 changes the return shape so each scalar
+    — current `ai_extract` v2.1 (now the recommended default, verified live)
+    changes the return shape so each scalar
     field comes back as an object (`{value, citation_ids,
     confidence_score}`) rather than the raw value, which would require
     every `result:response:<field>` access in this plan to become
@@ -553,12 +610,17 @@ profile.
 18. **Write the JSON findings file** (§4 schema) to the Volume (Part B),
     one file per `rss_silver` row processed this run, `status:
     "pending_review"`.
-19. **Non-throwing execution for steps 14–17**: wrap each AI Function
-    call with error-capturing execution (e.g. `failOnError => false`
-    where the function supports it) rather than aborting the whole
-    entry — a failed step for one entry writes what succeeded plus an
-    `errors` entry (§4 schema) into that entry's JSON file, rather than
-    dropping the RSS entry or crashing the whole batch. A Phase 7 alert
+19. **Non-throwing execution for steps 14–17**: capture errors per AI
+    Function call rather than aborting the whole entry — the mechanism is
+    **function-specific** (verified live during cross-review): `ai_query`
+    takes a `failOnError => false` argument and returns
+    `STRUCT<result, errorMessage>`; `ai_classify` and `ai_extract` do
+    **not** accept `failOnError` — instead they already return a VARIANT
+    carrying an `error_message` field (null on success), so read that field
+    rather than passing an unsupported argument. Either way, a failed step
+    for one entry writes what succeeded plus an `errors` entry (§4 schema)
+    into that entry's JSON file, rather than dropping the RSS entry or
+    crashing the whole batch. A Phase 7 alert
     on non-empty `errors` arrays is out of scope for this plan (Build Plan
     07) but the `errors` field must exist and be populated correctly now
     so that later plan has something to alert on.
@@ -640,12 +702,35 @@ Vector-Search read is designed to no-op without it), sharing only the
 
 - **Why a plain Job, not a Lakeflow Declarative Pipeline `http_request`
   dataset, does the polling** (already investigated and locked in
-  `PROJECT-PLAN.md` §2 Phase 2): `http_request`'s return type exposes no
-  response headers (can't read back `ETag`/`Last-Modified`), it's
-  explicitly scoped away from high-volume batch use in its own docs, and
-  LDP's retry/full-refresh semantics fight a side-effecting, stateful
-  HTTP call regardless of which function makes it. Don't revisit this
+  `PROJECT-PLAN.md` §2 Phase 2): `http_request`'s return type is only
+  `STRUCT<status_code INT, text STRING>` — it exposes **no response
+  headers**, so `ETag`/`Last-Modified` can't be read back for conditional
+  GET (corroborated by `databricks-dbsql` `references/ai-functions.md`); it
+  also requires a pre-provisioned UC HTTP `CONNECTION` object plus
+  `USE CONNECTION` privilege (setup this design otherwise doesn't need);
+  and LDP's retry/full-refresh semantics fight a side-effecting, stateful
+  HTTP call regardless of which function makes it. (The earlier "scoped
+  away from high-volume batch use" phrasing is dropped — `databricks-dbsql`
+  does not state that limitation; the rejection stands on the header,
+  connection, and LDP-semantics reasons above.) Don't revisit this
   without a genuinely new reason — it's a settled, evidenced decision.
+- **`read_files` is also not a live-polling mechanism** (per
+  `databricks-dbsql` `references/ai-functions.md`): it reads files already
+  in cloud storage or a UC Volume (XML/glob/streaming supported) — it does
+  **not** perform live HTTP fetches or expose response headers/cursors, so
+  it can't replace the polling Job's conditional GET. It would be relevant
+  only if the polling Job first landed raw RSS/XML snapshots to a Volume,
+  after which `read_files(..., format => 'xml')` could parse them — a
+  strictly more complex two-hop path with no benefit here, so not used.
+- **Job-level retries + failure notifications** (per `databricks-jobs`
+  `references/notifications-monitoring.md`): set `max_retries` on **both**
+  Jobs — both are designed idempotent (the polling Job's conditional-GET +
+  cursor; the Research Agent's watermark advances only after all findings
+  are written), so a task-level retry safely covers transient
+  fetch/`ai_query` failures. Also set `email_notifications.on_failure`
+  (and/or `webhook_notifications.on_failure`) on both — this is the skill's
+  idiomatic health signal and is what §8's "is polling healthy" check and
+  Build Plan 07's future error alerting hook into.
 - **The Table update trigger fires on commit, not per row** — Part F
   step 11's watermark-based enumeration exists specifically to handle
   this; don't build Part F assuming "one trigger fire = one new
@@ -657,9 +742,10 @@ Vector-Search read is designed to no-op without it), sharing only the
   not silently skip the feature.
 - **AI Functions need a higher DBR/compute floor than Variant Shredding**
   (§2 Prerequisites): `ai_query`/`ai_classify`/`ai_extract` require
-  DBR ≥18.2 and serverless compute (no Pro/Classic SQL warehouse support)
-  — this applies only to the Research Agent Job (Part F), not the polling
-  Job (Part C), which has no such requirement.
+  DBR ≥18.2 and serverless compute (no Pro/Classic SQL warehouse support),
+  **verified live during cross-review** — select serverless by omitting
+  cluster config (not by pinning a DBR); applies only to the Research Agent
+  Job (Part F), not the polling Job (Part C).
 - **`ai_classify` guardrails** (§5 Part F step 15): pin
   `options => map('version', '2.0', 'multilabel', 'true', ...)` — v1/
   default behavior lacks multilabel mode and has much smaller limits.
@@ -672,8 +758,10 @@ Vector-Search read is designed to no-op without it), sharing only the
   staying on 2.0 keeps direct scalar access. Tri-state as string enum not
   boolean, ≤128 fields / ≤7 nesting levels.
 - **Non-throwing batch execution** (§5 Part F step 19): every AI Function
-  call in this Job must use error-capturing execution; a single bad call
-  must never abort the whole run.
+  call must capture errors, but the mechanism differs by function —
+  `failOnError => false` for `ai_query`; the returned `error_message`
+  VARIANT field for `ai_classify`/`ai_extract` (which don't accept
+  `failOnError`). A single bad call must never abort the whole run.
 - **Idempotent DDL**: `CREATE TABLE IF NOT EXISTS`, not
   `CREATE OR REPLACE`, for `rss_bronze` on redeploy (§5 Part A step 1) —
   the same caution applies to the Lakebase tables' migration mechanism
@@ -775,12 +863,13 @@ Vector-Search read is designed to no-op without it), sharing only the
   path depends on it.
 - **Exact daily polling Job schedule hour** (§5 Part C step 6) — pick a
   specific afternoon/evening-UTC hour and record it here once chosen.
-- **`table_changes` boundary source for Part F step 11** — whether the
-  `end_version` bound comes from the trigger payload's own exposed commit
-  version or a separate `DESCRIBE HISTORY`-style lookup at run start, and
-  whether the `trigger.table_update` config needs/benefits from debounce
-  options — confirm the current Jobs trigger API's exact shape and record
-  the choice here before finalizing Part E/Part F step 11.
+- **`table_changes` boundary source for Part F step 11** — *resolved by
+  cross-review against `databricks-jobs`*: the `table_update` trigger
+  exposes no payload, so `end_version` comes from a `DESCRIBE HISTORY`-style
+  version lookup at run start (Part F step 11), not a trigger-payload value;
+  and the debounce fields (`min_time_between_triggers_seconds`,
+  `wait_after_last_change_seconds`) do exist and are now set in Part E.
+  Nothing left open here.
 - **Confidence/rationale for classifications**, if the Review App (Build
   Plan 04) ends up wanting them — deliberately not built here since
   `ai_classify` doesn't provide them natively (§5 Part F step 15); would
@@ -831,3 +920,43 @@ only (binary document files) — doesn't fit Part F's live-fetched-HTML/
 tabular inputs, so not adopted here. Noted in §5 step 16 and cross-linked
 to `PROJECT-PLAN.md`'s Phase 1 note, which flags it as the right tool
 *if* a future document-file-based docs corpus is added.
+
+**Second cross-review (vs. `databricks-jobs` + `databricks-dbsql`, with a
+live-docs tiebreaker):** audited this plan against the two additional
+CLI-installed skills that co-own its Job/trigger and AI-Function design.
+Applied from `databricks-jobs`: added the **required** `pause_status:
+UNPAUSED` to the `table_update` trigger block (its omission is the skill's
+#1 "trigger not firing" cause); resolved the debounce open item by setting
+`min_time_between_triggers_seconds`/`wait_after_last_change_seconds`; added
+`max_concurrent_runs: 1` + `queue: {enabled: true}` so a trigger firing
+during an active run is queued, not silently dropped; **dropped the
+unsupported "trigger payload exposes a commit version" branch** in Part F
+step 11 (the skill documents a trigger payload only for `file_arrival`,
+never `table_update`) and committed to the `DESCRIBE HISTORY` version
+lookup; corrected the serverless-selection *mechanism* (serverless is
+chosen by omitting cluster config, not by pinning a DBR); added `max_retries`
++ `email_notifications.on_failure` guidance for both Jobs; specified the
+cron block's required `timezone_id`/`pause_status`; noted `for_each_task`
+as the idiomatic per-installation loop; and flagged that only `ANY_UPDATED`
+is documented (do not use `ALL_UPDATED` unverified). Applied from
+`databricks-dbsql`: regrounded the `http_request` rejection on its
+corroborated reasons (return type is only `STRUCT<status_code, text>` — no
+response headers — plus the required UC HTTP `CONNECTION`/`USE CONNECTION`
+privilege) and dropped the unsupported "high-volume batch" wording;
+explicitly rejected `read_files` for live polling (it reads stored files,
+not live HTTP); added the `ai_query` single-top-level-field `responseFormat`
+constraint; added a `CLUSTER BY AUTO` recommendation for `rss_silver`; and
+added a caveat against wrapping the watermark/findings sequence in a
+Preview multi-statement transaction. **Live-docs tiebreaker (the key
+finding):** `databricks-dbsql` and `databricks-ai-functions` disagreed on
+the AI Functions API surface, so a third agent verified against live
+docs.databricks.com — the richer v2 API (`ai_classify` options/version/
+multilabel/500-label/array return; `ai_extract` options/version/wrapped
+`result:response`, v2.1 per-field `{value, citation_ids, confidence_score}`)
+and the DBR ≥ 18.2 + serverless-for-notebooks floor are all **current and
+correct**, and `databricks-dbsql` is **stale** (documents the legacy v1
+shapes and the older ~15.x floor). The plan was therefore **not** downgraded;
+instead the divergence is recorded as a concrete instance of the exact skill
+staleness this project targets. `failOnError` was corrected to `ai_query`-only
+(`ai_classify`/`ai_extract` surface errors via an `error_message` VARIANT
+field instead).
