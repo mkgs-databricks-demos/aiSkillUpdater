@@ -2,15 +2,15 @@
 
 **Source of truth:** `docs/PROJECT-PLAN.md` §1 (architecture diagram),
 §1c, §1d, §2 Phase 1, §2 Phase 6 (two-index / shared-endpoint decision),
-§3, §5, §6. This plan restates what's needed to build Phase 1; it does not
+§3 (skills reused), §4 (build order). This plan restates what's needed to build Phase 1; it does not
 re-litigate design decisions already locked there — if something here
 seems to conflict with `PROJECT-PLAN.md`, that file wins and this plan is
 stale.
 
-**Cross-reviewed:** _pending_ — an independent structural pass (`pi`) and
-an independent Databricks-mechanics fact-check pass (`codex`) will review a
-first draft of this plan; every BLOCKING finding from both will be folded
-into the version below. See the changelog at the bottom of this file.
+**Cross-reviewed:** an independent structural pass (`pi`) and an
+independent Databricks-mechanics fact-check pass (`codex`) both reviewed a
+first draft of this plan; every BLOCKING finding from both is folded into
+the version below. See the changelog at the bottom of this file.
 
 **Why this phase is built second (per `PROJECT-PLAN.md` §4's build
 order):** the suggested order runs Phase 2 (Build Plan 01) *before* Phase 1
@@ -34,9 +34,11 @@ stale, or absent corpus must degrade Phase 2 gracefully, not break it (see
 > mechanism (Job + `MERGE`, with an Autoloader-LDP alternative — §5 Part
 > D), scrape-state storage (a Delta companion table, not Lakebase — §4 and
 > §10 #3), the URL/section scope (a bounded, config-driven seed set — §10
-> #1), and the refresh cadence (weekly — §10 #2). Each is called out where
-> it appears and consolidated in §10 for the repo owner and cross-review to
-> confirm or override.
+> #1), and the refresh cadence (weekly — §10 #2). Each *discretionary*
+> choice is consolidated in §10 for the repo owner and cross-review to
+> confirm or override; the scrape-mechanism choice (a Job, not a pipeline)
+> is instead a locked constraint inherited from `PROJECT-PLAN.md`, noted in
+> §5 Part C and §7 rather than §10.
 
 ---
 
@@ -86,9 +88,13 @@ same index, not built here.
   index in `-ai-tools` (Part E) is created against it.
 - **A managed-embedding Foundation Model endpoint available in the
   workspace.** Resolve the *current* recommended managed-embedding
-  endpoint from the `databricks-vector-search` skill at build time — do
-  **not** hardcode a legacy GTE/BGE name. `databricks-qwen3-embedding-0-6b`
-  is current as of this writing (`PROJECT-PLAN.md` §2 Phase 1); confirm
+  endpoint from **official Databricks docs** at build time — do **not**
+  hardcode a legacy GTE/BGE name. (Cross-review note: the locally-installed
+  `databricks-vector-search` skill is itself stale here — it still lists
+  legacy `databricks-gte-large-en`/`databricks-bge-large-en` — so verify
+  against docs, not the skill. Another concrete instance of the drift this
+  project targets.) `databricks-qwen3-embedding-0-6b` is current as of this
+  writing and matches current docs for Storage-Optimized usage; confirm
   before building.
 - **Serverless compute** for the scrape/chunk Job (same profile as Build
   Plan 01's RSS Job — an outbound HTTP fetch plus a Spark/Delta write).
@@ -109,22 +115,30 @@ bundles:
 | Chunk step (files → `docs_corpus` `MERGE`) | `-infra` | Produces the index's source table |
 | Shared Storage-Optimized Vector Search **endpoint** | `-ai-tools` | Serving infra; also used by Build Plan 03 |
 | `docs_corpus` Delta Sync **index** | `-ai-tools` | Requires the source table to exist (and ideally have rows) first |
-| Post-deploy index setup job (fallback if index isn't a DAB resource) | `-ai-tools` | Idempotent create/update of endpoint + index |
+| Post-deploy index setup job (contingency only — see below) | `-ai-tools` | Idempotent create/update of endpoint + index, only if a runtime limit blocks the declared DAB resource |
 
 - **UC Volume access uses `grants`, not a bundle `permissions` block**
   (`PROJECT-PLAN.md` §2 Phase 1, cross-reviewed vs. `databricks-dabs`):
-  the infra-jobs SP needs `READ_VOLUME` + write privileges on the Volume;
-  the App / Research Agent SP needs at least read.
-- **The Vector Search index may not be a declarable DAB resource type**
-  (`PROJECT-PLAN.md` §2 Phase 1). Verify against the current
-  `databricks bundle schema`. If unsupported, deploy the endpoint/index via
-  an **idempotent post-deploy setup job** (safe to re-run on every deploy),
-  exactly as Build Plan 03 will for the `research_log` index — and the two
-  should share that job or a common helper rather than duplicating it.
-- **Service principal:** reuse the shared infra-jobs SP created in Build
-  Plan 01 (§1d creates a dedicated SP for the RSS Job; this corpus Job has
-  the same "writes only `-infra` tables/volumes" profile). Do **not** mint
-  a new one unless cross-review finds a permissions reason to isolate them.
+  the infra-jobs SP needs `READ_VOLUME` + `WRITE_VOLUME` on the Volume;
+  the App / Research Agent SP needs at least `READ_VOLUME`.
+- **The Vector Search endpoint and index ARE declarable DAB resource
+  types** — cross-review confirmed `resources.vector_search_endpoints` and
+  `resources.vector_search_indexes` in the CLI v1.5.0 `databricks bundle
+  schema`. **Declare them directly in the `-ai-tools` bundle.** This
+  corrects a stale "may not be" hedge that was in `PROJECT-PLAN.md` §2
+  Phase 1 / §1d (now fixed there too — itself an instance of the staleness
+  this project exists to catch). Keep an idempotent post-deploy setup job
+  ONLY as a contingency if a specific runtime workspace limitation blocks
+  the declared resource at deploy time; it is no longer the primary path.
+  Build Plan 03 should follow the same declared-resource approach for its
+  `research_log` index (and the two can share a common helper if the
+  contingency path is ever needed).
+- **Service principal:** reuse the shared infra-jobs SP introduced in Build
+  Plan 01 §3 / Part A step 2 — one SP that runs both the RSS polling Job
+  and the Research Agent Job (Build Plan 00 created only the App's own SP).
+  This corpus Job has the same "writes only `-infra` tables/volumes"
+  profile. Do **not** mint a new one unless cross-review finds a
+  permissions reason to isolate them.
 
 ## 4. Data model
 
@@ -145,11 +159,14 @@ index's source table. One row per chunk.
 | `content_hash` | `STRING` | Hash of the *source page's* cleaned text, copied onto every chunk — lets the chunk step skip unchanged pages |
 | `fetched_at` | `TIMESTAMP` | When the source page was last fetched |
 
-- **`TBLPROPERTIES`**: `delta.enableChangeDataFeed = true` (**required** —
-  a Delta Sync index needs CDF on its source table; confirm exact
-  requirement against `databricks-vector-search`). `CLUSTER BY AUTO` for
-  clustering (`PROJECT-PLAN.md` conventions). Row Tracking optional; CDF is
-  the hard requirement here.
+- **`TBLPROPERTIES`**: `delta.enableChangeDataFeed = true`. **Nuance
+  (cross-review):** CDF on the source table is documented as the Delta Sync
+  requirement for **standard** endpoints; for the **Storage-Optimized**
+  endpoint this plan uses (§5 Part E) it is not clearly the same hard gate.
+  Enable it anyway — it's harmless and enables efficient incremental sync —
+  but confirm the current Storage-Optimized requirement against official
+  docs rather than treating it as an unconditional blocker. `CLUSTER BY
+  AUTO` for clustering. Row Tracking optional.
 - **Chunk sizing must respect the embedding endpoint's max input tokens.**
   Size chunks (e.g. by heading section, then a token-bounded splitter) so
   no `chunk_text` exceeds the pinned managed-embedding model's limit —
@@ -168,7 +185,7 @@ index's source table. One row per chunk.
 | `content_hash` | `STRING` | Cleaned-text hash of the last fetched version (drives "did this page actually change") |
 | `http_status` | `INT` | Last response status (200 / 304 / 4xx / 5xx) |
 | `last_fetched_at` | `TIMESTAMP` | Last fetch attempt |
-| `last_error` | `STRING` | Nullable; last fetch/parse error for observability (Phase 7) |
+| `last_error` | `STRING` | Nullable; last fetch/parse error for observability (Build Plan 07 / Phase 7) |
 
 > **Decision — scrape state lives in Delta, not Lakebase.** `PROJECT-PLAN.md`
 > §1c routes the *RSS* polling cursor to Lakebase because it is tiny (1–3
@@ -191,10 +208,11 @@ intentionally stays in Delta.)
 
 1. Create a UC **managed Volume** (e.g. `<catalog>.<schema>.docs_corpus_raw`)
    to hold cleaned page files written by the scrape Job.
-2. Grant the infra-jobs SP `READ_VOLUME` + write on the Volume via bundle
-   `grants` (not `permissions`). Grant the Research Agent / App SP read if
-   any downstream step needs the raw files (the index reads `docs_corpus`,
-   not the Volume, so read-only is likely sufficient / optional).
+2. Grant the infra-jobs SP `READ_VOLUME` + `WRITE_VOLUME` on the Volume
+   via bundle `grants` (not `permissions`). Grant the Research Agent / App
+   SP `READ_VOLUME` if any downstream step needs the raw files (the index
+   reads `docs_corpus`, not the Volume, so read-only is likely sufficient /
+   optional).
 
 ### Part B — `docs_corpus` + `docs_scrape_state` tables (`-infra`)
 
@@ -234,6 +252,8 @@ same reasoning that made the RSS fetch a Job in Build Plan 01.
    from `docs_scrape_state` — write the cleaned page as a file to the
    Volume (path keyed by a stable, URL-derived name plus `content_hash`, so
    the chunk step can tell versions apart; see Part D's overwrite caveat).
+   Part C fetches and cleans whole pages only — chunk/token-limit sizing is
+   handled later, in Part D step 12.
 10. **Upsert `docs_scrape_state`** for every URL touched: refreshed
     `etag`/`last_modified`/`content_hash`/`http_status`/`last_fetched_at`,
     and `last_error` on failure. A single URL's fetch/parse failure must
@@ -282,17 +302,24 @@ same reasoning that made the RSS fetch a Job in Build Plan 01.
 16. **Create the `docs_corpus` Delta Sync index** with **managed
     embeddings**, `TRIGGERED` pipeline type, `primary_key = chunk_id`,
     embedding source column `chunk_text`, and the pinned current
-    managed-embedding endpoint (§2). Include `source_cloud`, `url`,
-    `doc_title`, `section_path` in `columns_to_sync` so retrieval can
-    filter/attribute results.
+    managed-embedding endpoint (§2). The primary key and the embedding
+    source column are always synced automatically, so `columns_to_sync`
+    only needs the extra *metadata* fields — `source_cloud`, `url`,
+    `doc_title`, `section_path` — so retrieval can filter/attribute
+    results.
 17. **Trigger a sync after each corpus refresh.** `TRIGGERED` indexes do
-    not sync automatically — the refresh Job (Part C/D) must call
-    `sync_index()` (or the equivalent) after the `MERGE`/delete completes,
-    exactly as Build Plan 03's pipeline does for `research_log`. Confirm the
-    current trigger mechanism against `databricks-vector-search`.
-18. If the index is **not** a DAB-declarable resource (§3), implement the
-    endpoint+index creation as the idempotent post-deploy setup job and
-    have Part C/D's refresh call the sync.
+    not sync automatically — the refresh Job (Part C/D) must call the
+    current SDK/CLI sync operation for the index (e.g. `sync_index()` where
+    available) after the `MERGE`/delete completes, exactly as Build Plan
+    03's pipeline does for `research_log`. Confirm the current sync API name
+    against official docs (SDK method names have shifted with the AI Search
+    rename).
+18. **Primary path: declare the endpoint + index as DAB resources**
+    (`resources.vector_search_endpoints`, `resources.vector_search_indexes`
+    — confirmed in the v1.5.0 bundle schema, §3). Only if a runtime
+    workspace limitation blocks that at deploy time, fall back to the
+    idempotent post-deploy setup job. Either way, Part C/D's refresh calls
+    the sync (step 17).
 
 ### Part F — Refresh schedule + the corpus-optional contract with Build Plan 01
 
@@ -346,20 +373,27 @@ same reasoning that made the RSS fetch a Job in Build Plan 01.
 
 ## 7. Platform constraints to build against (to be cross-review-confirmed)
 
-- **Delta Sync index requires Change Data Feed on the source table** —
-  `docs_corpus` sets `delta.enableChangeDataFeed = true` (Part B). Confirm
-  exact requirement/behavior against `databricks-vector-search`.
+- **Change Data Feed on the source table** — `docs_corpus` sets
+  `delta.enableChangeDataFeed = true` (Part B). CDF is documented as the
+  Delta Sync requirement for **standard** endpoints; for the
+  **Storage-Optimized** endpoint used here it may not be a hard gate —
+  enable it regardless (harmless + enables incremental sync), but confirm
+  the current Storage-Optimized requirement against official docs, not the
+  (stale) local skill.
 - **Managed embeddings need a Foundation Model embedding endpoint**; pin
   the *current* one, not a legacy GTE/BGE name (§2). Confirm the endpoint
   name and its **max input tokens** (drives chunk sizing, §4/Part D).
-- **`TRIGGERED` indexes do not auto-sync** — an explicit `sync_index()`
-  call after each refresh is required (Part E step 17).
+- **`TRIGGERED` indexes do not auto-sync** — an explicit sync call (the
+  current SDK/CLI sync operation, e.g. `sync_index()`) after each refresh is
+  required (Part E step 17).
 - **One Storage-Optimized endpoint, shared** with Build Plan 03 (§6);
   a Delta Sync index maps 1:1 to one source table, so the two indexes stay
   separate even while sharing the endpoint (`PROJECT-PLAN.md` §2 Phase 6).
-- **The Vector Search index may not be a DAB resource type** — verify
-  `databricks bundle schema`; fall back to the idempotent post-deploy setup
-  job (§3, Part E step 18).
+- **The Vector Search endpoint + index ARE declarable DAB resources**
+  (`resources.vector_search_endpoints` / `resources.vector_search_indexes`,
+  confirmed v1.5.0 schema) — declare them; the post-deploy setup job is a
+  contingency only (§3, Part E step 18). Corrects a stale "may not be"
+  hedge that was in `PROJECT-PLAN.md`.
 - **UC Volume access via `grants`, not `permissions`** (§3).
 - **Scraping is a Job, not an LDP** (no HTTP source; `http_request` in LDP
   rejected — §5 Part C).
@@ -403,7 +437,9 @@ same reasoning that made the RSS fetch a Job in Build Plan 01.
 
 - The `-infra` bundle creates the docs-corpus Volume, `docs_corpus`, and
   `docs_scrape_state`; the scrape+chunk Job runs on schedule and populates
-  `docs_corpus` idempotently from the tracked clouds' docs.
+  `docs_corpus` idempotently from the tracked clouds' docs — including
+  deleting orphaned chunks when a source page shrinks (Part D step 14), so
+  the index never serves removed sections.
 - The `-ai-tools` bundle (or its post-deploy setup job) creates the shared
   Storage-Optimized endpoint (if absent) and the `docs_corpus` Delta Sync
   index with managed embeddings on the current embedding endpoint, synced
@@ -455,3 +491,47 @@ same reasoning that made the RSS fetch a Job in Build Plan 01.
    endpoint name must be identical across this plan and Build Plan 03.
    Record both as shared config; resolve who owns the "create if absent"
    helper (proposed: this plan, since it builds first — §6).
+
+## 11. Changelog
+
+- **Draft → cross-reviewed (`codex` mechanics + `pi` structure).** Both
+  reviewers ran against the committed first draft; all BLOCKING findings
+  applied.
+  - **`codex` BLOCKING #1 — CDF requirement qualified.** The draft called
+    `delta.enableChangeDataFeed = true` an unconditional hard requirement
+    for Delta Sync. Corrected: CDF is documented as the requirement for
+    **standard** endpoints; for the **Storage-Optimized** endpoint this
+    plan uses it may not be a hard gate — enable it regardless (harmless +
+    enables incremental sync) but confirm against docs, not the (stale)
+    skill. (§4, §7.)
+  - **`codex` BLOCKING #2 — Vector Search endpoint/index ARE declarable DAB
+    resources.** The draft (inheriting a stale `PROJECT-PLAN.md` hedge) said
+    they "may not be" and pushed a post-deploy setup job as the primary
+    path. Confirmed against the CLI v1.5.0 `databricks bundle schema`
+    (`resources.vector_search_endpoints` / `resources.vector_search_indexes`):
+    declare them directly; the post-deploy job is now a contingency only.
+    Also corrected the source hedge in `PROJECT-PLAN.md` §2 Phase 1 / §1d so
+    Build Plan 03 doesn't inherit it. (§3, §5 Part E step 18, §7.)
+  - **`codex` BLOCKING #3 — explicit `WRITE_VOLUME`.** Replaced generic
+    "write privileges" with the named UC privilege `WRITE_VOLUME`. (§3, §5
+    Part A step 2.)
+  - **`codex` NITs applied:** resolve the embedding endpoint from official
+    docs, not the stale local skill (which still lists legacy GTE/BGE —
+    flagged as another staleness instance); softened `sync_index()` to "the
+    current SDK/CLI sync operation, e.g. `sync_index()`" given the AI Search
+    rename; noted PK + embedding-source column are always synced so
+    `columns_to_sync` only needs metadata fields. (Orphan-delete logic,
+    Jobs cron conventions, the `ai_prep_search` rejection, and the LDP /
+    `http_request` rationale were all reviewer-confirmed sound — no change.)
+  - **`pi` NITs applied:** fixed the service-principal provenance note (the
+    shared infra-jobs SP is introduced in Build Plan 01 §3 / Part A step 2,
+    runs both Jobs — not "created by §1d"); narrowed the over-broad
+    PROJECT-PLAN source citation (dropped §5 versioning / §6 open questions,
+    which have no corpus-relevant content; added §4 build order); softened
+    the header's "consolidated in §10" claim since scrape-is-a-Job is a
+    locked constraint, not a §10 open item; labeled "Phase 7" as "Build
+    Plan 07 / Phase 7"; added a Part C→Part D forward pointer on chunk
+    sizing; added orphaned-chunk deletion to the §9 Definition of Done for
+    parity with Build Plan 01's rigor. `pi` found **no BLOCKING** issues and
+    verified the "Build Plan 01 Part F step 13" cross-reference resolves
+    correctly (no off-by-N bug).

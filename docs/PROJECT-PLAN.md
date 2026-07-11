@@ -484,11 +484,11 @@ which is what DAB targets are for.
   expected to fail, not just be suboptimal.
   - The Vector Search endpoint and both indexes (docs corpus, § Phase 1;
     `research_log`, § Phase 2b) — both require their source Delta tables
-    to already exist in UC, per this project's existing DAB-bundling
-    finding that the index itself may not even be a declarable bundle
-    resource type (verify against current `databricks bundle schema`;
-    fall back to the already-planned idempotent post-deploy setup job if
-    not)
+    to already exist in UC. The endpoint and indexes ARE declarable bundle
+    resources (`resources.vector_search_endpoints` /
+    `resources.vector_search_indexes`, confirmed in the v1.5.0 bundle
+    schema) — declare them; an idempotent post-deploy setup job is a
+    contingency only, not the default
   - Genie Spaces, if/when added (§ Phase 6 stretch) — same
     data-must-exist-first constraint as Vector Search
   - Any external MCP tools registered against Unity Catalog objects with
@@ -626,15 +626,18 @@ which is what DAB targets are for.
   whole project exists to catch.)
 - **DAB bundling notes (cross-reviewed vs. `databricks-dabs`)**, relevant
   to Phase 1 and Phase 2b alike: (a) UC Volume resources in the bundle
-  need explicit **`grants`**/UC privileges (e.g. `READ_VOLUME`, write
-  privileges as needed) — not a generic bundle `permissions` block, which
-  applies to job/app/pipeline resources, not volume access; (b) **Vector
-  Search endpoints/indexes are not confirmed as a documented DAB resource
-  type** — verify current `databricks bundle schema` support before
-  assuming the index itself can be declared in the bundle. If unsupported
-  or incomplete, the DAB deploys the jobs/pipelines/app/volumes as usual,
-  and a small **post-deploy setup job** creates or updates the Vector
-  Search endpoint/index idempotently (safe to re-run on every deploy).
+  need explicit **`grants`**/UC privileges (`READ_VOLUME`, and
+  `WRITE_VOLUME` for writers) — not a generic bundle `permissions` block,
+  which applies to job/app/pipeline resources, not volume access; (b)
+  **Vector Search endpoints/indexes ARE declarable DAB resource types** —
+  `resources.vector_search_endpoints` and `resources.vector_search_indexes`
+  are present in the CLI v1.5.0 `databricks bundle schema` (confirmed by
+  Build Plan 02's cross-review; this corrects an earlier "not confirmed"
+  hedge here — itself an instance of exactly the staleness this project
+  catches). **Declare them in the bundle.** A small idempotent
+  **post-deploy setup job** remains a *contingency only*, for a specific
+  runtime workspace limitation discovered at deploy time — not the default
+  path.
   Per §1d: the UC Volumes and the pipelines/tables they feed belong to
   **`-infra`**; the Vector Search endpoint/index (and its post-deploy
   setup job, if needed) belongs to **`-ai-tools`**, deployed only after
