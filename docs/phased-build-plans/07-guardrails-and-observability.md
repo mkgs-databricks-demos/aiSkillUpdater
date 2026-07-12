@@ -9,10 +9,13 @@ signal and said "Build Plan 07 alerts on it"). This plan consolidates those.
 If something here seems to conflict with `PROJECT-PLAN.md`, that file wins and
 this plan is stale.
 
-**Cross-reviewed:** _pending_ — a first draft. An independent structural pass
-(`pi`) and an independent Databricks/mechanics fact-check pass (`codex`) will
-review this draft; every BLOCKING finding from both will be folded into a
-revised version, with a changelog at the bottom.
+**Cross-reviewed:** an independent structural pass (`pi`) and an independent
+Databricks-mechanics fact-check pass (`codex`) both reviewed a first draft of
+this plan; every BLOCKING finding from both is folded into the version below
+(most consequentially: Slack alerting goes through a Databricks notification
+destination, not a raw webhook URL; and data-level monitoring defaults to a
+sweep Job because SQL Alerts can't span Delta + Lakebase). See the changelog at
+the bottom of this file.
 
 **What this phase is, in one sentence:** the cross-cutting layer that (a)
 watches every failure/anomaly signal the other phases emit and alerts a human
@@ -106,8 +109,8 @@ guardrails hold, it does not reimplement them.
 | Resource | Bundle | Notes |
 |---|---|---|
 | Job-level `on_failure` notifications | each Job's own bundle | Attached to the Jobs that already live in `-infra` (RSS, Research Agent, drift-adjacent) and `-ai-tools` (CLI-drift). This plan ensures every Job has the hook; the hooks ship with their Jobs, not as a separate resource. |
-| Data-quality monitoring sweep (§5 Part B) | `-infra` *(proposed)* | It reads across the Delta state (`research_log`, bronze) and the Lakebase state (cursor, scrape-state, installations, overrides), all `-infra`-side, so a scheduled sweep Job belongs in `-infra` (§11 #6). |
-| Slack webhook secret / notification destination | `-infra` secret scope | The scope is `-infra`'s (Build Plan 00 §3); the value is written at deploy/runtime, not in bundle YAML (same pattern as the GitHub App secrets). |
+| Data-quality monitoring sweep (§5 Part B) | `-infra` *(default: a scheduled Job)* | It reads across **both** the Delta state (`research_log`, bronze) and the Lakebase state (cursor, scrape-state, installations, overrides) — a scheduled sweep Job can span both stores, which is why it's the default over SQL Alerts (cross-review BLOCKING #2, §11 #2). Belongs in `-infra` (§11 #6). |
+| Slack **notification destination** (workspace-level, backed by Slack) + any backing secret | `-infra` (destination admin-managed; secret in `-infra` scope) | Databricks Jobs reference a **notification destination by ID**, not a raw Slack URL (cross-review BLOCKING #1). The destination is created once at the workspace level; job bundles reference its ID. Any backing credential lives in the `-infra` secret scope (Build Plan 00 §3), written at runtime, not in bundle YAML. |
 | Alert-state / dedup table (if used, §5 Part D) | *open — §11 #4/#6* | Small Lakebase OLTP state (last-alerted fingerprint per problem) — same DDL/bundle-ownership question as the other Lakebase tables (Build Plan 00 §10). |
 | Guardrail invariant + verification (§5 Part C) | cross-cutting | Not a deployable — a documented invariant plus a test/audit; see §5 Part C. |
 
@@ -129,33 +132,42 @@ here.** This plan adds no new source data; it watches these and alerts.
 | `installations.status = failed` (stuck onboarding) | Build Plan 00 §4 | data-level | monitoring sweep |
 | `classification_overrides.regeneration_status = failed` | Build Plan 04 §4 | data-level | monitoring sweep |
 | `ai_classify` "no existing skill matched" (New-Feature-only) | Build Plan 01 §5 Part F step 15 | data-level | monitoring sweep (§5 Part B, §11 #3) |
-| GitHub API / token-scope failure on accept→PR | Build Plan 04 §5 Part E | app-level | surfaced in-App + optionally Slack (§5 Part A) |
+| GitHub API / token-scope failure on accept→PR | Build Plan 04 §5 Part E (action source); clear-error surfacing in Build Plan 04 §7 | app-level | surfaced in-App + optionally Slack (§5 Part A) |
 
 **Delivery split (design):** *job-level* failures use the platform's own Jobs
-`webhook_notifications.on_failure` → Slack (no custom code). *Data-level*
-signals need a **scheduled monitoring sweep** (§5 Part B) that queries the state
-and emits Slack alerts, since they aren't job crashes. *App-level* failures
-(GitHub) surface in the App UI (Build Plan 04 already shows a clear error) and
-optionally also Slack.
+`webhook_notifications.on_failure` pointed at a **Databricks notification
+destination backed by Slack** (referenced by ID, not a raw Slack URL —
+cross-review BLOCKING #1); no custom code. *Data-level* signals need a
+**scheduled monitoring sweep Job** (§5 Part B) that queries the state and emits
+Slack alerts, since they aren't job crashes and must span both Delta and
+Lakebase (cross-review BLOCKING #2). *App-level* failures (GitHub) surface in
+the App UI (Build Plan 04 §7 already shows a clear error) and optionally also
+Slack.
 
 ## 5. Task breakdown
 
 ### Part A — Job-level failure alerting (each Job's bundle)
-1. Ensure **every** Job in the system has `on_failure` notifications routed to
-   the Slack destination: RSS polling + Research Agent (Build Plan 01 §7 already
-   set `email_notifications`/`webhook_notifications.on_failure` — point them at
-   Slack), the ingestion pipeline (Build Plan 03), and the CLI-drift Job (Build
-   Plan 06). Prefer `webhook_notifications` → a Slack incoming webhook (or a
-   Databricks notification destination) over email as the primary channel, per
-   Phase 7's "Slack" (§11 #1); keep email as an optional backup.
-2. Confirm `max_retries` is set (Build Plan 01 §7 already does for its Jobs) so
-   a transient failure retries before it alerts — the alert should fire on
-   *terminal* failure, not the first transient blip.
+1. Ensure **every** Job in the system routes `on_failure` to a **Databricks
+   notification destination backed by Slack** (create the destination once at
+   the workspace level; reference it by **ID** in `webhook_notifications` — a
+   raw Slack incoming-webhook URL is *not* the Jobs webhook shape, cross-review
+   BLOCKING #1): RSS polling + Research Agent (Build Plan 01 §7 already set
+   `email_notifications`/`webhook_notifications.on_failure` — point them at the
+   destination), the ingestion pipeline (Build Plan 03), and the CLI-drift Job
+   (Build Plan 06). Prefer this over email as the primary channel, per Phase 7's
+   "Slack" (§11 #1); keep email as an optional backup.
+2. Confirm retries are configured at the relevant task/job level (Build Plan 01
+   §7 already sets `max_retries` for its Jobs) and route the failure
+   notification for the **final failed run/task after retries are exhausted** —
+   so the alert fires on terminal failure, not the first transient blip.
 
 ### Part B — Data-quality monitoring sweep (`-infra`)
-3. Build a **scheduled sweep** (a small Job, or Databricks SQL Alerts over
-   queries — pick one, §11 #2) that scans the data-level signals in §4 and emits
-   a Slack alert per new problem:
+3. Build a **scheduled sweep Job** (the default — a small Job can query **both**
+   the Delta and Lakebase state; Databricks SQL Alerts cannot span both stores
+   unless PostgreSQL federation via `remote_query` or a Lakebase→UC Lakehouse
+   Sync is explicitly set up, so SQL Alerts is only an option if that's added —
+   cross-review BLOCKING #2, §11 #2) that scans the data-level signals in §4 and
+   emits a Slack alert per new problem:
    - non-empty `research_log.errors`; non-null `_rescued_data` in bronze;
    - `rss_polling_cursor.last_checked_at` older than a freshness threshold
      (polling should advance ~daily — Build Plan 01 — so e.g. >48h stale is an
@@ -164,13 +176,15 @@ optionally also Slack.
    - `classification_overrides.regeneration_status = failed`.
 4. **`ai_classify` no-skill-match detection (§11 #3):** `ai_classify` returns no
    native confidence (Build Plan 01 §5 Part F step 15), so "low confidence for
-   all skills" is operationalized as **"the entry's only label is `"New
-   Feature"` (or the label set is empty/degenerate)"** — i.e. it matched no
-   existing skill. Alert on those so a genuinely-new capability is surfaced for
-   a human to consider as a new skill, rather than filed quietly. (This is a
-   feature signal, not an error — route it as informational, not critical.)
-5. Scope every sweep query by `installation_id` and run it on serverless; it is
-   pure read + alert, no writes to the source state.
+   all skills" is operationalized as a **taxonomy-gap metric** — `label_count =
+   0` or `labels = ["New Feature"]` (the entry matched no existing skill). Track
+   and surface it so a genuinely-new capability is raised for a human to consider
+   as a new skill, rather than filed quietly. (This is a feature/taxonomy signal,
+   not an error — route it as informational, not critical.)
+5. Scope every sweep query by `installation_id` and run it on serverless. It
+   makes **no writes to the source state** (the Delta/Lakebase tables it reads);
+   it writes only its **own alert-state/dedup rows** (§5 Part D) — cross-review
+   BLOCKING #3.
 
 ### Part C — Guardrail codification + verification (cross-cutting)
 6. **Codify the invariant** explicitly: *no skill change reaches a user except
@@ -186,7 +200,9 @@ optionally also Slack.
    / code-audit checklist over a runtime assertion where possible, since the
    guardrail is architectural. Do **not** add any auto-merge or auto-apply path
    "for convenience" — that would violate the invariant this plan exists to
-   protect.
+   protect. As optional defense-in-depth *outside* Databricks, GitHub branch
+   protection / CODEOWNERS on the configured repo can additionally enforce human
+   review on the PR side.
 
 ### Part D — Alert routing, dedup, throttle (`-infra`)
 8. **Dedup + throttle** so a persistent problem alerts once, not every sweep/
@@ -207,8 +223,10 @@ optionally also Slack.
   (Build Plan 03 pipeline, Build Plan 06 Job) — a small, additive change to
   those plans' Jobs, not a redesign.
 - **Build Plan 01 §7 already set the Job notification hooks** (`max_retries`,
-  `email_notifications`/`webhook_notifications.on_failure`) — this plan is "the
-  later plan those hooks were built for" (Build Plan 01 §7 says exactly this).
+  `email_notifications`/`webhook_notifications.on_failure`) — this plan is the
+  later plan those hooks were built for (Build Plan 01 §7 notes the hooks are
+  what its polling-health check "and Build Plan 07's future error alerting hook
+  into").
 - **The guardrail (Part C) verifies Build Plan 04's + Build Plan 05's behavior**
   (accept→PR-never-merge; apply-only-accepted) — it does not reimplement them;
   it asserts they hold system-wide.
@@ -218,17 +236,22 @@ optionally also Slack.
 
 ## 7. Platform constraints to build against (to be cross-review-confirmed)
 
-- **Jobs `webhook_notifications` vs. `email_notifications`** — confirm the
-  supported Slack path (a Slack incoming-webhook via `webhook_notifications`, or
-  a Databricks notification destination) and prefer it over email for the
-  primary channel (§11 #1). Build Plan 01's `databricks-jobs`
-  `references/notifications-monitoring.md` is the reference.
-- **Databricks SQL Alerts vs. a sweep Job** for the data-level signals (§5 Part
-  B, §11 #2) — SQL Alerts are the native "query + threshold + notify" mechanism
-  and may cover most data-level signals without custom code; confirm they can
-  target Slack and read the Delta + Lakebase state, else use a small scheduled
-  Job. Don't assume one without checking.
-- **Serverless is sufficient** for the sweep (pure read + notify).
+- **Jobs Slack path = a notification destination, not a raw webhook URL**
+  (cross-review BLOCKING #1): create a workspace **notification destination
+  backed by Slack** and reference it by ID from
+  `webhook_notifications.on_failure` (per `databricks-jobs`
+  `references/notifications-monitoring.md`); prefer it over email for the
+  primary channel (§11 #1). A raw Slack incoming-webhook URL in the job YAML is
+  not the supported shape.
+- **Data-level monitoring = a sweep Job by default** (cross-review BLOCKING #2,
+  §5 Part B, §11 #2): Databricks SQL Alerts are the native "query + threshold +
+  notify" mechanism but **cannot span both Delta and Lakebase Postgres state**
+  natively — that needs PostgreSQL federation via `remote_query` (with a
+  connection) or a Lakebase→UC Lakehouse Sync, neither assumed here. So default
+  to a small scheduled Job (which can read both); use SQL Alerts only if that
+  federation/sync is explicitly set up.
+- **Serverless is sufficient** for the sweep (read source state + notify; the
+  only writes are its own alert-state/dedup rows — cross-review BLOCKING #3).
 - **No new AI Functions / Vector Search** — the `ai_classify` no-match signal is
   read from existing `research_log` labels, not a new classification call.
 - **Alert fatigue is a real failure mode** — a monitoring layer that cries wolf
@@ -298,18 +321,22 @@ optionally also Slack.
 
 ## 11. Open items carried forward (decisions to confirm in cross-review)
 
-1. **Slack delivery mechanism per signal class (§5 Part A/B, §3).** Jobs
-   `webhook_notifications` (Slack incoming webhook) vs. a Databricks
-   notification destination for job-level; and how data-level alerts reach the
-   same Slack channel. Confirm the supported path and prefer it over email.
-2. **Data-quality monitoring mechanism (§5 Part B).** Databricks SQL Alerts
-   (native query+threshold+notify) vs. a small scheduled sweep Job — confirm SQL
-   Alerts can target Slack and read both Delta and Lakebase state, else use a
-   Job. Pick one.
+1. **Slack delivery mechanism per signal class (§5 Part A/B, §3).** Resolved
+   toward a **Databricks notification destination backed by Slack** (referenced
+   by ID from Jobs `webhook_notifications`, not a raw URL — cross-review
+   BLOCKING #1); confirm the data-level sweep alerts post to the same Slack
+   channel (via the destination or the Slack API). Prefer over email.
+2. **Data-quality monitoring mechanism (§5 Part B).** Resolved toward a **small
+   scheduled sweep Job** (cross-review BLOCKING #2), since SQL Alerts cannot span
+   both Delta and Lakebase state without PostgreSQL federation (`remote_query`)
+   or a Lakebase→UC Lakehouse Sync being explicitly added. Confirm the Job's
+   cross-store read + Slack post; use SQL Alerts only if that federation/sync is
+   set up.
 3. **`ai_classify` no-skill-match detection (§5 Part B step 4).** Confirm the
-   operational definition ("only label is `New Feature`, or empty/degenerate
-   labels") given `ai_classify` has no native confidence (Build Plan 01 §5 Part
-   F step 15), and that it routes as informational, not critical.
+   operational definition as a **taxonomy-gap metric** (`label_count = 0` or
+   `labels = ["New Feature"]`) given `ai_classify` has no native confidence
+   (Build Plan 01 §5 Part F step 15), and that it routes as informational, not
+   critical.
 4. **Alert dedup/throttle + state (§5 Part D).** The fingerprint key
    (`installation_id, signal_type, subject_id`), the cooldown, recovery notes,
    and where the last-alerted state lives (Lakebase vs. alert-mechanism-native).
@@ -337,3 +364,31 @@ optionally also Slack.
   the job-level-vs-data-level delivery split (§4), the SQL-Alerts-vs-sweep-Job
   mechanism (§11 #2), and operationalizing the `ai_classify` no-match signal
   without native confidence (§11 #3).
+- **Cross-review fold-in (`codex` mechanics + `pi` structure).**
+  - **`codex` BLOCKING #1 — Slack via Jobs is a notification destination, not a
+    raw webhook URL.** Databricks Jobs reference a workspace notification
+    destination (backed by Slack) by **ID** in `webhook_notifications`; a raw
+    Slack incoming-webhook URL isn't the supported shape. Corrected §3, §4, §5
+    Part A step 1, §7, and §11 #1.
+  - **`codex` BLOCKING #2 — SQL Alerts can't span Delta + Lakebase.** SQL Alerts
+    can't natively query both stores without PostgreSQL federation
+    (`remote_query`) or a Lakebase→UC Lakehouse Sync, so the data-level
+    monitoring now **defaults to a scheduled sweep Job** (which can read both),
+    with SQL Alerts only if that federation/sync is added. Corrected §3, §4, §5
+    Part B step 3, §7, and §11 #2.
+  - **`codex` BLOCKING #3 — "pure read, no writes" vs. the dedup state table.**
+    Clarified §5 Part B step 5 / §7: the sweep writes **no source state** but
+    does write its **own** alert-state/dedup rows (§5 Part D).
+  - **`codex` NITs:** retry wording now says "notify on the final failed
+    run/task after retries are exhausted" (§5 Part A step 2); the `ai_classify`
+    no-match signal is framed as a **taxonomy-gap metric** (`label_count = 0` or
+    `labels = ["New Feature"]`), informational (§5 Part B step 4, §11 #3); added
+    optional GitHub branch-protection/CODEOWNERS defense-in-depth to the
+    guardrail (§5 Part C step 7). `codex` confirmed serverless sufficiency, no
+    new AI Functions/Vector Search, and that the §4 signal set matches the
+    emitter contracts.
+  - **`pi` structure — CLEAN, no BLOCKING, no numbering bug**, all cross-file
+    citations to Build Plans 00–06 + PROJECT-PLAN resolve. Two NITs fixed:
+    softened the "Build Plan 01 §7 says exactly this" paraphrase in §6; and the
+    §4 GitHub-error row now cites both Build Plan 04 §5 Part E (action source)
+    and §7 (the clear-error surfacing).
