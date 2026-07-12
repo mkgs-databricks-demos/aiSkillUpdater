@@ -37,8 +37,9 @@ human-in-the-loop posture. See `PROJECT-PLAN.md` §2 Phase 3.
 > the same queue) but leaves several *hows* open. This plan makes explicit,
 > flagged choices for: the **review-queue Lakebase data model** (§4, §11 #1);
 > **the entry point the classification-override re-trigger actually calls**
-> into Build Plan 01's Research Agent Job — a genuine cross-plan gap, since
-> that Job has no single-entry regeneration mode today (§5 Part D, §6, §11 #2);
+> into Build Plan 01's Research Agent Job — a cross-plan contract this plan
+> opened and Build Plan 01 §5 Part F step 21 now specifies (`mode=regenerate_single`),
+> pending a build-time parameter-name confirmation (§5 Part D, §6, §11 #2);
 > **where the §5 frontmatter version bump logic lives** on accept/save (§5
 > Part E, §11 #3); **how a single review queue holds both `research_log`-origin
 > and starter-pack-diff-origin items** (§4, §5 Part F, §11 #4); the **SQL
@@ -267,12 +268,13 @@ id, so a pending review item does not dangle.
       run-and-wait — the Apps reverse proxy enforces a hard **120 s
       per-request timeout**, well under a full research/classify/extract/diff
       regeneration;
-    - targets **Build Plan 01's Research Agent Job** — **but that Job has no
-      single-entry-by-`research_log_id`-under-override-label run mode today.**
-      This is a real cross-plan gap: see §6 and §11 #2 for the entry-point
-      contract that must be added to Build Plan 01 (a parameterized run mode:
-      `mode=regenerate_single`, `research_log_id`, `override_label`,
-      `installation_id`) before this step is buildable.
+    - targets **Build Plan 01's Research Agent Job** via its
+      `mode=regenerate_single` run mode (parameters: `mode=regenerate_single`,
+      `research_log_id`, `override_label`, `installation_id`). This entry point
+      is now **specified in Build Plan 01 §5 Part F step 21** (added after this
+      plan opened the gap); see §6 and §11 #2. Confirm the exact parameter names
+      match Build Plan 01 §5 Part F step 21 at build time — both sides must
+      agree.
 13. When regeneration completes, Build Plan 03's pipeline lands a new/updated
     `research_log` row (same `research_log_id`, stable per its §11 #1), and the
     card refreshes to show the diff grounded in the human-confirmed label.
@@ -346,15 +348,16 @@ id, so a pending review item does not dangle.
   whether the App backend mints directly or via a shared helper — the same
   question Build Plan 01 §10 left open for the Research Agent SP.
 - **Research Agent Job re-trigger entry point** (Build Plan 01 Part F):
-  **this is a gap, not a settled contract.** Build Plan 01's Job is
-  `table_update`-triggered over `rss_silver` and enumerates new rows by
-  watermark; it has **no** parameterized single-entry regeneration mode. Part D
-  here needs one. The contract to add to Build Plan 01 (see §11 #2):
-  a `jobs()`-invokable run mode `mode=regenerate_single` taking
-  `research_log_id` + `override_label` + `installation_id`, which re-runs Build
-  Plan 01 §5 Part F steps 12–18 for that one entry under the override label and
-  writes a findings file Build Plan 03 re-ingests to the same `research_log_id`.
-  **Must be reconciled with Build Plan 01 before Part D is built.**
+  **now a specified contract.** Build Plan 01's Job is `table_update`-triggered
+  over `rss_silver` and enumerates new rows by watermark for its batch path; it
+  now also exposes a `jobs()`-invokable run mode `mode=regenerate_single`
+  (Build Plan 01 §5 Part F step 21) taking `research_log_id` + `override_label`
+  + `installation_id`, which re-runs Build Plan 01 §5 Part F steps 12–18 for
+  that one entry under the override label (replacing step 15's classify with the
+  fixed label) and writes a findings file Build Plan 03 re-ingests to the same
+  `research_log_id`. **Confirm the parameter names match Build Plan 01 §5 Part F
+  step 21 before Part D is built** — the contract is defined on both sides now,
+  but the two must stay in agreement.
 - **Taxonomy buckets** (Build Plan 01 §5 Part F step 15): the
   `taxonomy_buckets` table here is exactly what Build Plan 01 reads to extend
   the `ai_classify` label set. Keep the read contract (per-installation
@@ -475,14 +478,15 @@ per-installation scoping are agreed):**
    held for review (`proposed_content_ref`: read verbatim from `research_log`
    for research-origin items vs. dedicated storage for pack-diff items).
 2. **The regeneration entry point into Build Plan 01's Research Agent Job
-   (§5 Part D, §6).** Biggest cross-plan gap in this plan. Build Plan 01's Job
-   has no single-entry-by-`research_log_id`-under-override-label run mode.
-   Decide: add a parameterized `mode=regenerate_single` run mode to that Job
-   (preferred — reuses the same synthesis/classify/extract logic) vs. a
-   separate lightweight regeneration job owned here. **Must be reconciled with
-   Build Plan 01 before Part D is built**, and Build Plan 01 §10's
-   "SP mints GitHub token directly vs. calls back into the App" question is
-   entangled with it.
+   (§5 Part D, §6).** Formerly the biggest cross-plan gap in this plan; **now
+   specified.** Build Plan 01 §5 Part F step 21 adds the parameterized
+   `mode=regenerate_single` run mode (the preferred resolution — reuses the
+   same synthesis/extract/diff logic rather than a separate job). Remaining at
+   build time: **confirm the parameter names** (`research_log_id`,
+   `override_label`, `installation_id`) match on both sides, and note that Build
+   Plan 01 §10's "SP mints GitHub token directly vs. calls back into the App"
+   question is still entangled with it (that one decision serves both the batch
+   and regeneration paths).
 3. **Where the §5 frontmatter version-bump logic lives (§5 Part E step 15).**
    Proposed: the App backend owns it, applied identically on accept and
    editor-save. Confirm the exact `metadata.version` increment rule
@@ -537,3 +541,12 @@ per-installation scoping are agreed):**
     `jobs()` fire-and-poll + 120 s timeout, GitHub App token-mint model, AppKit
     lock-in, `research_log` VARIANT reads, and the real BP01 regeneration gap
     (§11 #2) are all mechanically sound.
+- **Cross-plan amendment (`mode=regenerate_single` now specified).** Build Plan
+  01 §5 Part F step 21 was added to close the classification-override
+  regeneration gap this plan opened. Updated the four live references here (§1
+  header callout, §5 Part D step 12, §6, §11 #2) to cite the now-specified
+  contract in Build Plan 01 rather than describe an unfilled gap; the remaining
+  build-time task is confirming the parameter names (`research_log_id`,
+  `override_label`, `installation_id`) agree on both sides. The historical
+  "Initial draft" changelog entry above is left as-is (accurate record of the
+  gap as first surfaced).

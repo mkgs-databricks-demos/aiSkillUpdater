@@ -629,6 +629,53 @@ task sequencing, not a DB transaction.
     ≠ "error-free"), advance `rss_silver_watermark.last_processed_commit_version`
     for this installation (per step 11's ordering requirement).
 
+### Part F (alternate entry) — single-entry regeneration mode (`mode=regenerate_single`)
+
+21. **Parameterized on-demand regeneration run mode.** In addition to the
+    `table_update`-triggered batch path (steps 11–20), the Research Agent Job
+    exposes a parameterized run mode invoked **on demand** by Build Plan 04's
+    Review App (via the AppKit `jobs()` plugin, fire-and-poll) when a user
+    **overrides a proposal's classification** and the corrected-label diff must
+    be regenerated. This is the entry-point contract Build Plan 04 requests
+    (Build Plan 04 §5 Part D / §6 / §11 #2); it is specified here so that gap
+    is closed from this plan's side. It reuses the same synthesis/extract/diff
+    logic rather than duplicating it in a separate job.
+    - **Parameters** (job/run parameters, not a trigger): `mode=regenerate_single`,
+      `research_log_id`, `override_label`, `installation_id`. When `mode` is
+      absent/`batch` the Job runs the steps 11–20 path unchanged; branch on
+      `mode` at entry.
+    - **Source resolution:** this mode does **not** read `rss_silver` by
+      watermark. Resolve the single source entry by looking up `research_log_id`
+      in `research_log` (Build Plan 03 §4) to recover its originating
+      `rss_silver` entry (`guid`/`link` + fetched context needed for step 12).
+      `research_log_id` is not reversible (it is a content hash — Build Plan 03
+      §11 #1), so the `research_log` row is the required lookup, not a
+      recomputation.
+    - **Behavior:** re-run steps 12–18 for that **one** entry, with exactly two
+      differences from the batch path: (a) step 15's `ai_classify` call is
+      **replaced by the fixed `override_label`** — the user has already chosen
+      the bucket, so do not re-classify (this includes a user-created new
+      bucket per §5 Part F step 15 / Build Plan 04's taxonomy override); and
+      (b) step 13's optional corpus lookup is best-effort as always. Step 17's
+      diff draft still fetches current `SKILL.md` content via the same GitHub
+      App token, and step 19's per-function non-throwing error capture still
+      applies.
+    - **Output:** write a findings file (§4 schema) for that single entry under
+      `override_label` with `status: "pending_review"`. Build Plan 03's pipeline
+      re-ingests it to the **same** `research_log_id` (stable per Build Plan 03
+      §11 #1), so the Review App card refreshes in place rather than creating a
+      duplicate row (Build Plan 04 §5 Part D step 13).
+    - **Watermark isolation:** this mode neither reads nor advances
+      `rss_silver_watermark` (steps 11 and 20 are skipped), so a regeneration
+      run and a concurrent `table_update`-triggered batch run cannot corrupt
+      each other's watermark state. The Job's `max_concurrent_runs: 1` +
+      `queue: {enabled: true}` (Part E) still serialize the two; that is
+      acceptable for a low-frequency, human-initiated action.
+    - **Inherited open dependency:** the "SP mints the GitHub token directly
+      vs. calls back into the App" question (§10, shared with Build Plan 04
+      §11 #2) applies identically here since step 17 reads repo content — it
+      does not need a *new* decision, just the same one, once.
+
 ## 6. Explicit fan-out map
 
 **Preconditions (block everything else in this plan):**
@@ -853,6 +900,13 @@ Vector-Search read is designed to no-op without it), sharing only the
   itself, or must call back into the App** (§5 Part A step 3) — must be
   resolved against Build Plan 00's actual implementation before Part F
   step 15/17 are built; record the answer here once known.
+- **Single-entry regeneration contract (`mode=regenerate_single`)** — now
+  **specified** in §5 Part F step 21 (added after Build Plan 04 opened the
+  gap from its side). Not an open decision anymore; the only carried-forward
+  dependency is the shared GitHub-token-minting question above, which it
+  reuses rather than re-opening. Validate the parameter contract against
+  Build Plan 04 §5 Part D at build time (both sides must agree on the exact
+  parameter names `research_log_id` / `override_label` / `installation_id`).
 - **One Job instance serving all installations vs. one Job per
   installation** (§5 Part C step 7) — must be decided and recorded before
   Part C/Part F are fully scoped; this plan's task descriptions are
@@ -960,3 +1014,13 @@ instead the divergence is recorded as a concrete instance of the exact skill
 staleness this project targets. `failOnError` was corrected to `ai_query`-only
 (`ai_classify`/`ai_extract` surface errors via an `error_message` VARIANT
 field instead).
+
+**Cross-plan amendment (`mode=regenerate_single`):** added §5 Part F step 21,
+a parameterized single-entry regeneration run mode, closing the entry-point
+gap Build Plan 04 opened (its §5 Part D / §6 / §11 #2) for the
+classification-override re-trigger. The mode reuses steps 12–18 for one
+`research_log_id`, replaces step 15's `ai_classify` with the user's fixed
+`override_label`, skips the watermark (steps 11/20), and writes a findings
+file Build Plan 03 re-ingests to the same `research_log_id`. Build Plan 04's
+three references were updated in the same amendment to cite this now-specified
+contract rather than describing an unfilled gap. Pending cross-review.
