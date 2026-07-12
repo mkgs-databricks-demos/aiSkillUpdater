@@ -29,7 +29,7 @@ an independent sub-agent lens before being marked ready.
 | 05 | [`05-local-installer.md`](05-local-installer.md) | Phase 5 | Cross-reviewed (codex + pi) |
 | 06 | [`06-cli-drift-detection.md`](06-cli-drift-detection.md) | Phase 4 | Cross-reviewed (codex + pi) |
 | 07 | [`07-guardrails-and-observability.md`](07-guardrails-and-observability.md) | Phase 7 | Cross-reviewed (codex + pi) |
-| 08 | [`08-knowledge-base-search-and-mcp-server.md`](08-knowledge-base-search-and-mcp-server.md) | Phase 6 (stretch) | Draft — cross-review pending |
+| 08 | [`08-knowledge-base-search-and-mcp-server.md`](08-knowledge-base-search-and-mcp-server.md) | Phase 6 (stretch) | Cross-reviewed (codex + pi) |
 
 Ordering here follows `PROJECT-PLAN.md` §4's suggested build order, not the
 phase numbers themselves (Phase 2 before Phase 1, etc.) — see that section

@@ -11,10 +11,13 @@ needed to build Phase 6; it does not re-litigate decisions already locked
 there — if something here seems to conflict with `PROJECT-PLAN.md`, that file
 wins and this plan is stale.
 
-**Cross-reviewed:** _pending_ — a first draft. An independent structural pass
-(`pi`) and an independent Databricks/mechanics fact-check pass (`codex`) will
-review this draft; every BLOCKING finding from both will be folded into a
-revised version, with a changelog at the bottom.
+**Cross-reviewed:** an independent structural pass (`pi`) and an independent
+Databricks-mechanics fact-check pass (`codex`) both reviewed a first draft of
+this plan; every BLOCKING finding from both is folded into the version below.
+Cross-review **resolved the project's biggest unknown** — Databricks MCP
+hosting — from a concrete set of supported mechanisms (managed MCP over the
+Vector Search index, or custom MCP hosted in the App). See the changelog at the
+bottom of this file.
 
 **What this phase is, in one sentence:** it exposes the knowledge this project
 has accumulated (`research_log` + the docs corpus, already indexed in Vector
@@ -87,15 +90,17 @@ consumer, never a dependency).
 - **Build Plan 04 built** — the App shell hosts the search UI, and (per §11 #1's
   outcome) very possibly the MCP server too; the Data Access Gate and
   per-installation scoping are Build Plan 04's.
-- **A build-time investigation of MCP hosting on Databricks** (§11 #1) — this
-  should happen *before* Part B is scoped, given how open the mechanism is.
+- **A build-time spike to pick the MCP hosting mechanism** (§11 #1) — the
+  supported mechanisms are now known (managed VS MCP vs. custom App-hosted); the
+  spike chooses between them (chiefly on per-installation scoping) before Part B
+  is scoped.
 
 ## 3. Bundle placement (per `PROJECT-PLAN.md` §1d)
 
 | Resource | Bundle | Notes |
 |---|---|---|
 | Search UI | `-app` | A surface inside Build Plan 04's App. |
-| MCP server | *open — §11 #1* | If custom-hosted in the App → `-app`; if a Databricks-managed Vector Search MCP server or a model-serving front → `-ai-tools` (alongside the indexes/endpoints it fronts). The hosting decision determines the bundle. |
+| MCP server | `-ai-tools` (managed VS MCP) or `-app` (custom App-hosted) — §11 #1 | Resolved to a set of supported mechanisms: a Databricks-managed MCP server over the VS index (→ `-ai-tools`, alongside the index) or a custom MCP hosted in the App (→ `-app`). **Not** model serving. The spike (§11 #1) picks which; that sets the bundle. |
 | Genie Space (optional, §5 Part C) | `-ai-tools` | Per §1d, Genie Spaces are `-ai-tools` stretch resources (data-must-exist-first). Only if pursued (§11 #5). |
 | The two Vector Search indexes + shared endpoint | *not here* | Owned by Build Plans 02/03 (`-ai-tools`); consumed read-only. |
 
@@ -115,7 +120,7 @@ Two consumers over the **same** two indexes (shared Storage-Optimized endpoint):
   `research_log_id`, since those aren't in the index — Build Plan 03 §4) and to
   the classified skill.
 
-**(b) MCP server (App-hosted, §11 #1):** a small tool surface (§11 #6), e.g.:
+**(b) MCP server (Databricks-managed over the VS index, or custom App-hosted — §11 #1):** a small tool surface (§11 #6), e.g.:
 - `search_guidance(query, filters?)` — HYBRID search over `research_log`,
   returns ranked entries (id, summary snippet, label, links).
 - `which_skill_covers(query)` — returns the most relevant skill(s)/label(s).
@@ -129,36 +134,55 @@ All scoped per `installation_id`; all read-only.
 ### Part A — Search UI + HYBRID query (`-app`, extends Build Plan 04)
 1. Add a **search surface** to the Review App that issues a **HYBRID** Vector
    Search query against the `research_log` index (semantic ANN + keyword/BM25),
-   per `PROJECT-PLAN.md` §2 Phase 6 — confirm the exact HYBRID query API /
-   `query_type` parameter against current Vector Search docs (§11 #3).
-2. Establish the **App→Vector Search access path** (§11 #4): how the App issues
-   the VS query (SDK/REST via the App SP). Note this is a *different* access
+   per `PROJECT-PLAN.md` §2 Phase 6. Use `query_type="HYBRID"` (confirmed by
+   cross-review), with reranker parameters if reranking is wanted. **Important
+   for Storage-Optimized endpoints:** the filter syntax differs — use the
+   SQL-like `filters` form with the `databricks-vectorsearch` client, not
+   dict-style `filters_json`; pin the exact SDK/client + filter syntax for the
+   `installation_id` scoping this plan requires (§11 #3).
+2. Establish the **App→Vector Search access path** (§11 #4): the App issues the
+   VS query (SDK/REST) under the App SP, which requires **declaring/granting the
+   Vector Search resource to the App** (an App platform resource grant), like
+   any other Databricks resource the App uses. Note this is a *different* access
    than Build Plan 04's Data Access Gate (which governs warehouse-vs-Lakebase
-   reads of `research_log` rows) — a VS index query is its own path; clarify how
-   the two coexist (the Gate for row detail, VS for ranked retrieval).
+   reads of `research_log` rows) — a VS index query is its own retrieval path;
+   the Gate is for row detail, VS for ranked retrieval, and they coexist.
 3. Render results: ranked entries with a link to the full `research_log` entry;
    read `citations`/`availability` from the Delta row by `research_log_id` (not
    the index — Build Plan 03 §4). Scope every query by `installation_id`.
 
 ### Part B — MCP server (hosting decided by §11 #1; likely `-app`)
-4. **Decide the hosting mechanism first (§11 #1 — do a build-time spike):**
-   - **custom MCP server in the App** — the App serves an MCP endpoint
-     (JSON-RPC/SSE or streamable HTTP) directly;
-   - **a Databricks-managed Vector Search MCP server** — if the platform offers
-     a managed MCP surface over a VS index, front the `research_log` index with
-     it;
-   - **a model-serving front** — expose via a serving endpoint
-     (`databricks-model-serving` is listed as an optional dep only "if fronting
-     via an endpoint," `PROJECT-PLAN.md` §3).
-   This is the biggest unknown in the project; confirm what Databricks actually
-   supports before building (§7).
+4. **Choose among the supported hosting mechanisms (§11 #1 — resolved by
+   cross-review to a concrete set; a build-time spike picks one):**
+   - **Databricks-managed MCP server over the existing Vector Search index** —
+     the platform exposes managed MCP servers at
+     `/api/2.0/mcp/{resource_type}/{resource_identifier}` for Vector Search (and
+     Genie, UC functions/tables, Apps); front the `research_log` index with one.
+     Lowest custom-code path.
+   - **Custom MCP server hosted in the Databricks App** — the App serves an MCP
+     endpoint over standard MCP transports; requires declaring the resource with
+     `CAN_USE`. Use if the managed surface can't enforce the per-installation
+     scoping this project needs (§5 Part B step 6).
+   - **(Not an MCP host) model serving** — Model Serving is **not** a documented
+     MCP-server hosting mechanism; keep `databricks-model-serving` only for the
+     `PROJECT-PLAN.md` §3 "if fronting an agent/model that itself calls tools"
+     case, not as an MCP endpoint substitute.
+   The spike picks between managed-VS-MCP and a custom App-hosted server,
+   chiefly on whether managed MCP can enforce per-installation scoping (§7).
 5. Implement the **tool surface** (§4 / §11 #6): `search_guidance`,
    `which_skill_covers`, `get_entry`, optional `search_docs` — thin wrappers
    over the same HYBRID query + `research_log` row reads Part A uses.
-6. **Auth + per-installation scoping for external agents (§11 #2):** define how
-   a calling agent authenticates to the MCP server and how its queries are
-   scoped to the right installation's data. Do not expose cross-installation
-   data; do not expose write operations (read-only surface).
+6. **Auth + per-installation scoping for external agents (§11 #2):** the auth
+   model depends on the mechanism (cross-review): a **managed** MCP server uses
+   Databricks OAuth / U2M and enforces the caller's Databricks permissions on
+   the underlying resource; a **custom App-hosted** MCP server uses the App's
+   auth model + the App SP's declared resource permissions, with optional
+   user-authorization/OBO. **Per-installation scoping is not automatic** — the
+   tools must filter by `installation_id` (which Build Plan 03 syncs into the
+   index's scalar metadata), and a managed VS MCP server may not offer an
+   installation-scoped wrapper unless the index filters/tools enforce it (the
+   decisive factor for the §11 #1 spike). Never expose cross-installation data;
+   expose no write operations (read-only surface).
 
 ### Part C — Optional: Genie Space as an alternative NL surface (`-ai-tools`, §11 #5)
 7. Optionally stand up a **Genie Space** over `research_log` as a
@@ -186,15 +210,24 @@ All scoped per `installation_id`; all read-only.
 
 ## 7. Platform constraints to build against (to be cross-review-confirmed)
 
-- **MCP-server hosting on Databricks is the top unknown (§5 Part B, §11 #1).**
-  Confirm what's actually supported *now*: whether Databricks Apps can host a
-  custom MCP endpoint, whether there's a managed Vector Search MCP server, and
-  whether a model-serving front is the idiomatic path. Do **not** assume a
-  mechanism — a build-time spike precedes committing to one.
-- **HYBRID query support (§5 Part A, §11 #3):** confirm the Vector Search HYBRID
-  query API (the `query_type`/hybrid parameter and any reranking options)
-  against current docs — this was cross-review-guidance in `PROJECT-PLAN.md` §2
-  Phase 6, confirm the exact call.
+- **MCP-server hosting on Databricks — supported mechanisms now confirmed
+  (§5 Part B, §11 #1).** Cross-review resolved this from docs: managed MCP
+  servers exist for Vector Search (and Genie, UC functions/tables, Apps) at
+  `/api/2.0/mcp/{resource_type}/{resource_identifier}`, and custom MCP can be
+  hosted in a Databricks App (requires `CAN_USE` resource declaration). Model
+  serving is **not** an MCP host. The remaining build-time spike (an `explore`
+  task) is *which* of managed-VS-MCP vs. custom-App-MCP to use — decided chiefly
+  by whether managed MCP can enforce per-installation scoping.
+- **HYBRID query support (§5 Part A, §11 #3):** `query_type="HYBRID"` is
+  confirmed, with reranker parameters available. On the **Storage-Optimized**
+  endpoint this project uses, filter syntax differs — SQL-like `filters` with
+  the `databricks-vectorsearch` client, not dict-style `filters_json` — so pin
+  the exact SDK/client + filter form for `installation_id` scoping.
+- **Custom App-hosted MCP transport (if that mechanism is chosen):** the
+  Databricks Apps proxy buffers SSE and enforces a 120s per-request timeout, so
+  prefer **streamable HTTP / stateless MCP** over token-by-token SSE for any
+  long-running call (fine for short KB-search tools, but choose the transport
+  deliberately).
 - **Shared endpoint capacity:** two indexes already share one Storage-Optimized
   endpoint; adding query load (UI + MCP) should be checked against the
   endpoint's throughput expectations, though read query load is typically light.
@@ -261,16 +294,27 @@ All scoped per `installation_id`; all read-only.
 
 ## 11. Open items carried forward (decisions to confirm in cross-review)
 
-1. **MCP-server hosting mechanism (§5 Part B, §7) — the biggest unknown in the
-   project.** Custom MCP endpoint hosted in the Databricks App vs. a
-   Databricks-managed Vector Search MCP server vs. a model-serving front.
-   Requires a build-time spike to confirm what Databricks actually supports
-   *now* before committing; the choice also sets the MCP server's bundle (§3).
+1. **MCP-server hosting mechanism (§5 Part B, §7) — largely resolved by
+   cross-review.** Supported mechanisms are now known: (a) a Databricks-managed
+   MCP server over the existing Vector Search index (`/api/2.0/mcp/...`), (b)
+   managed MCP over Genie / a UC function/table / an App, or (c) a custom MCP
+   server hosted in a Databricks App (`CAN_USE` resource declaration). Model
+   serving is **not** an MCP host. The remaining decision (a small `explore`
+   spike): managed-VS-MCP vs. custom-App-MCP, decided chiefly by whether managed
+   MCP can enforce this project's per-installation scoping (§11 #2); the choice
+   sets the bundle (§3).
 2. **MCP auth + per-installation scoping for external agents (§5 Part B step
-   6).** How a calling agent authenticates to the MCP server and how its queries
-   scope to one installation's data; read-only enforcement.
-3. **HYBRID query API specifics (§5 Part A step 1).** Confirm the Vector Search
-   `query_type`/hybrid parameter and any reranking options against current docs.
+   6).** By mechanism: managed MCP = Databricks OAuth/U2M enforcing the caller's
+   permissions on the resource; custom App MCP = App auth + App SP resource
+   permissions + optional OBO. Per-installation scoping is **not** automatic —
+   tools must filter `installation_id`; confirm whether managed VS MCP can
+   enforce it (the deciding factor for §11 #1) or whether that forces the custom
+   App-hosted path. Read-only enforcement either way.
+3. **HYBRID query API specifics (§5 Part A step 1).** `query_type="HYBRID"` +
+   reranker params confirmed; the open piece is the **Storage-Optimized filter
+   syntax** — SQL-like `filters` with the `databricks-vectorsearch` client (not
+   `filters_json`) — pin the exact SDK/client and filter form for
+   `installation_id` scoping.
 4. **App→Vector Search access path vs. the Data Access Gate (§5 Part A step
    2).** How the App issues the VS query (SDK/REST via App SP) and how that
    coexists with Build Plan 04's warehouse-vs-Lakebase Data Access Gate (the
@@ -294,3 +338,33 @@ All scoped per `installation_id`; all read-only.
   the single biggest unknown in the project** and needs a build-time spike
   before Part B is scoped (§5 Part B / §7 / §11 #1), rather than assuming an
   App-hosting approach that may not be supported as written.
+- **Cross-review fold-in (`codex` mechanics + `pi` structure).**
+  - **`codex` resolved the project's biggest unknown (§11 #1).** Databricks
+    supports **managed MCP servers** for Vector Search (and Genie, UC
+    functions/tables, Apps) at `/api/2.0/mcp/{resource_type}/{resource_identifier}`,
+    plus **custom MCP hosted in a Databricks App** (`CAN_USE` resource
+    declaration). Upgraded the header, §2, §3, §4(b), §5 Part B step 4, §7, and
+    §11 #1 from "biggest unknown, assume nothing" to "supported mechanisms known;
+    a small `explore` spike picks managed-VS-MCP vs. custom-App-MCP."
+  - **`codex` BLOCKING — demote model serving.** It is **not** an MCP-server
+    hosting mechanism; kept only for the §3 "fronting a tool-calling agent/model"
+    case (§5 Part B step 4, §3, §11 #1).
+  - **`codex` BLOCKING — MCP auth/scoping by mechanism.** Managed MCP =
+    Databricks OAuth/U2M enforcing the caller's permissions; custom App MCP = App
+    auth + SP resource perms + optional OBO. **Per-installation scoping is not
+    automatic** — tools must filter `installation_id`; whether managed VS MCP can
+    enforce it is the deciding factor for the §11 #1 spike (§5 Part B step 6,
+    §11 #2).
+  - **`codex` BLOCKING — HYBRID on Storage-Optimized.** `query_type="HYBRID"`
+    confirmed, but Storage-Optimized uses SQL-like `filters` (not `filters_json`)
+    — pinned in §5 Part A step 1, §7, §11 #3 for `installation_id` scoping.
+  - **`codex` NITs:** the App must declare/grant the Vector Search resource to
+    the App SP (§5 Part A step 2); custom App-hosted MCP over SSE hits the Apps
+    proxy's SSE buffering + 120s timeout, so prefer streamable HTTP / stateless
+    MCP (§7); load-test UI + MCP concurrent reads. Genie-as-managed-MCP
+    strengthens the optional Genie path.
+  - **`pi` structure — CLEAN, no BLOCKING, no numbering bug**, all cross-file
+    citations resolve, §11 pointers complete/bidirectional, format parity holds,
+    and Part A (search UI) confirmed buildable standalone while Part B waits on
+    the spike. Cosmetic NITs noted (the §3 pointer-instead-of-bundle-name entries
+    are defensible for a stretch plan).
