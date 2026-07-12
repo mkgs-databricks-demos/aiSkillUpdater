@@ -12,10 +12,12 @@ it does not re-litigate design decisions already locked there — if something
 here seems to conflict with `PROJECT-PLAN.md`, that file wins and this plan is
 stale.
 
-**Cross-reviewed:** _pending_ — a first draft. An independent structural pass
-(`pi`) and an independent Databricks/mechanics fact-check pass (`codex`) will
-review this draft; every BLOCKING finding from both will be folded into a
-revised version, with a changelog at the bottom.
+**Cross-reviewed:** an independent structural pass (`pi`) and an independent
+Databricks/mechanics fact-check pass (`codex`) both reviewed a first draft of
+this plan; every BLOCKING finding from both is folded into the version below,
+and cross-review confirmed the `cli-compat.json` location + shape and the
+trigger endpoint directly from CLI source. See the changelog at the bottom of
+this file.
 
 **What this phase is, in one sentence:** a Job that, whenever a new Databricks
 CLI (`aitools`) version ships, resolves what skill content that CLI version
@@ -35,7 +37,7 @@ have diverged and need reconciliation. See `PROJECT-PLAN.md` §2 Phase 4.
 > **Decisions made in this plan that `PROJECT-PLAN.md` does not pin down.**
 > Phase 4 specifies the *what* (resolve CLI version → skills-repo ref via
 > `cli-compat.json`, fetch that ref's `manifest.json` + files, compare against
-> the tracking table's `base_cli_version` + `updated_version`, three outcomes)
+> the tracking table's `base_cli_version` + `metadata.version`, three outcomes)
 > but leaves several *hows* open. This plan makes explicit, flagged choices for:
 > **which repo `cli-compat.json` actually lives in** — `databricks/cli`
 > (`internal/build/`), *not* `databricks-agent-skills` as Phase 4's prose
@@ -46,7 +48,8 @@ have diverged and need reconciliation. See `PROJECT-PLAN.md` §2 Phase 4.
 > table's DDL/bundle ownership + migration mechanism** (inherited from Build
 > Plans 00/04 — §4, §11 #4); and the **re-base action's ownership seam** between
 > this phase (detect) and Build Plan 04 (render + execute via its PR flow)
-> (§6, §11 #5). Each discretionary choice is consolidated in §11 for the repo
+> (§6, §11 #5); and the **version-tracking table shape / projection semantics**
+> (§4, §11 #6). Each discretionary choice is consolidated in §11 for the repo
 > owner and cross-review to confirm or override.
 
 ---
@@ -69,7 +72,7 @@ conflicts to the human. When this plan is done:
    needed), and **classifies** each managed skill into one of three outcomes:
    - **CLI caught up** — CLI's shipped content is newer/equal and the project
      hasn't diverged → surface "consider re-basing onto the CLI's version."
-   - **Project ahead** — the project's `updated_version` is still ahead and the
+   - **Project ahead** — the project's `metadata.version` is still ahead and the
      CLI hasn't moved since the shared base → informational, no action.
    - **Conflict** — both diverged independently since `base_cli_version` → flag
      for **human reconciliation via a three-way diff**, never auto-resolved.
@@ -153,11 +156,18 @@ from the repo frontmatter + a fresh CLI fetch must be able to rebuild every row.
    the real location (§11 #1):** this file is `go:embed`'d in the
    **`databricks/cli`** repo at `internal/build/cli-compat.json`, **not** in
    `databricks-agent-skills` — `PROJECT-PLAN.md` §2 Phase 4's phrasing ("that
-   repo's `cli-compat.json`") is imprecise. Fetch it from the public
-   `databricks/cli` repo source at the CLI version's tag/ref (verify
-   fetchability + exact path at build — §7, §11 #1). If the mapping can't be
-   fetched, fall back to the CLI's changelog (as Phase 4 notes) or fail the run
-   cleanly with a clear message rather than guessing a ref.
+   repo's `cli-compat.json`") is imprecise. Its shape (confirmed against CLI
+   source in cross-review) maps each CLI version to a compatibility **object**,
+   e.g. `"1.0.0": {"appkit": "0.38.1", "skills": "0.2.9"}` — use the **`skills`**
+   field as the agent-skills ref, not the whole value. Fetch the mapping from
+   the public `databricks/cli` repo; note the runtime CLI actually reads it from
+   `main` (cached, with the `go:embed`'d copy as fallback) rather than a
+   release-tag path (`libs/clicompat`), so fetching at a specific release tag
+   works for current releases but **very old tags may predate the file** —
+   prefer the `main`/embedded copy and confirm the exact fetch path at build
+   (§7, §11 #1). If the mapping can't be fetched, fall back to the CLI's
+   changelog (as Phase 4 notes) or fail the run cleanly rather than guessing a
+   ref.
 
 ### Part B — Fetch the CLI's shipped skill content (`-ai-tools` Job)
 2. At the resolved ref, fetch the `databricks-agent-skills` **`manifest.json`**
@@ -190,7 +200,12 @@ from the repo frontmatter + a fresh CLI fetch must be able to rebuild every row.
    is recommended — a version-string bump alone, or a content change alone,
    should both count as "moved," and equality requires both to match. Do **not**
    rely on `metadata.version` semver ordering alone, since the project's
-   `+au.N` segment and the CLI's own scheme aren't directly comparable.
+   `+au.N` segment and the CLI's own scheme aren't directly comparable. The
+   content hash must be taken over the **normalized skill body/content**,
+   excluding project-only provenance frontmatter (`last_research_log_id`,
+   `updated_at`, the `+au.N` segment) — otherwise provenance churn would
+   false-positive as "moved" even when the semantic skill content is unchanged
+   (cross-review N3).
 7. **Upsert** the result into `skill_version_tracking` (§4): set
    `last_checked_cli_version`, `last_checked_skills_repo_ref`,
    `cli_shipped_version`, `drift_status`, `last_checked_at`. Never write
@@ -200,10 +215,11 @@ from the repo frontmatter + a fresh CLI fetch must be able to rebuild every row.
 ### Part D — Trigger + cadence (`-ai-tools` Job)
 8. **Detect a new CLI release** — there is no push, so poll: on a schedule
    (§11 #3 — cadence TBD, e.g. daily/weekly), check the `databricks/cli` GitHub
-   releases/tags for a version newer than `last_checked_cli_version`; also
-   expose a **manual "check now"** trigger from the Review App (Build Plan 04,
-   via its `jobs()` fire-and-poll pattern). Run Parts A–C when a newer version
-   is found (or on manual demand).
+   releases API — `api.github.com/repos/databricks/cli/releases/latest`, the
+   same endpoint the CLI's own version check uses — for a version newer than
+   `last_checked_cli_version`; also expose a **manual "check now"** trigger from
+   the Review App (Build Plan 04, via its `jobs()` fire-and-poll pattern). Run
+   Parts A–C when a newer version is found (or on manual demand).
 9. Make the run **idempotent**: re-checking the same CLI version against an
    unchanged repo produces the same `drift_status` rows (no spurious churn).
 
@@ -239,11 +255,12 @@ from the repo frontmatter + a fresh CLI fetch must be able to rebuild every row.
 ## 7. Platform constraints to build against (to be cross-review-confirmed)
 
 - **`cli-compat.json` lives in `databricks/cli`, not `databricks-agent-skills`**
-  (§5 Part A, §11 #1): it's a `go:embed` artifact at
-  `internal/build/cli-compat.json`. Confirm it is fetchable from the public
-  `databricks/cli` repo source at a release tag, and the exact path, before
-  relying on the fetch (the runtime CLI uses the embedded copy; this plan needs
-  the source-tree copy).
+  (§5 Part A, §11 #1): confirmed against CLI source — a `go:embed` artifact at
+  `internal/build/cli-compat.json`, mapping each CLI version to a `{appkit,
+  skills}` object (use the `skills` field). The runtime CLI reads it from `main`
+  (cached, with the embedded copy as fallback), not a release-tag path
+  (`libs/clicompat`); prefer the `main`/embedded copy and confirm the exact
+  fetch path at build, since very old release tags may predate the file.
 - **Unauthenticated public GitHub fetches** to `raw.githubusercontent.com` are
   subject to rate limits — use conditional GET / caching, and handle 403/429
   gracefully; the same consideration Build Plan 02's corpus scrape has.
@@ -324,19 +341,26 @@ from the repo frontmatter + a fresh CLI fetch must be able to rebuild every row.
 ## 11. Open items carried forward (decisions to confirm in cross-review)
 
 1. **Where `cli-compat.json` actually lives + its fetchability (§5 Part A,
-   §7).** It is `go:embed`'d in `databricks/cli` (`internal/build/
-   cli-compat.json`), **not** `databricks-agent-skills` as Phase 4's prose
-   implies. Confirm the source-tree copy is fetchable from the public
-   `databricks/cli` repo at a release tag, the exact path, and its JSON shape
-   (CLI version → skills-repo ref) — the whole resolution step depends on it.
+   §7).** **Resolved in cross-review:** it is `go:embed`'d in `databricks/cli`
+   (`internal/build/cli-compat.json`), **not** `databricks-agent-skills` as
+   Phase 4's prose implies, and its shape maps each CLI version to a
+   `{appkit, skills}` object (use the `skills` field as the agent-skills ref).
+   Confirm the exact fetch path at build — the runtime CLI reads it from `main`
+   (cached, embedded fallback) rather than a release tag, and very old tags may
+   predate the file, so prefer the `main`/embedded copy over a per-tag fetch.
 2. **The exact three-way comparison algorithm (§5 Part C).** How "moved /
    diverged / newer" is defined — recommended: content-hash equality against the
    base **plus** `metadata.version` change, not semver ordering of
    `metadata.version` (the `+au.N` segment isn't comparable to the CLI's
-   scheme). Confirm and pin.
+   scheme). The hash must be over the **normalized skill body/content**,
+   excluding project-only provenance frontmatter (`last_research_log_id`,
+   `updated_at`, the `+au.N` segment) so provenance churn doesn't false-positive
+   as "moved" (cross-review N3). Confirm and pin, with fixtures.
 3. **New-CLI-release trigger + cadence (§5 Part D).** No push exists; poll
-   `databricks/cli` releases/tags on a schedule (pick a cadence) plus a manual
-   "check now" from the App. Confirm the cadence and the release-source API.
+   `databricks/cli` releases on a schedule (pick a cadence) plus a manual
+   "check now" from the App. The release-source API is confirmed:
+   `api.github.com/repos/databricks/cli/releases/latest` (the endpoint the CLI's
+   own version check uses). Confirm the cadence.
 4. **Version-tracking table DDL/bundle ownership + migration mechanism (§3,
    §4).** Same unresolved question as Build Plan 00 §10 / Build Plan 04 §11 #7 —
    whether the table's DDL ships in `-infra` or with the App, and the Lakebase
@@ -362,3 +386,26 @@ from the repo frontmatter + a fresh CLI fetch must be able to rebuild every row.
   implies (§5 Part A / §7 / §11 #1), and specifying a **content-hash + base**
   comparison rather than `metadata.version` semver ordering (§5 Part C / §11 #2),
   since the project's `+au.N` segment isn't comparable to the CLI's own scheme.
+- **Cross-review fold-in (`codex` mechanics + `pi` structure).**
+  - **`codex` confirmed the key nuance from CLI source** — `cli-compat.json`
+    lives in `databricks/cli` (`internal/build/`), not `databricks-agent-skills`
+    — and enriched three details, all folded in: (N1) its shape maps CLI version
+    → a `{appkit, skills}` object, so use the **`skills`** field as the ref
+    (§5 Part A, §7, §11 #1); (N2) the runtime CLI reads the mapping from `main`
+    (cached, embedded fallback), not a release-tag path, and very old tags may
+    predate the file — prefer the `main`/embedded copy (§5 Part A, §7, §11 #1);
+    (N3) the content hash must exclude project-only provenance frontmatter
+    (`last_research_log_id`, `updated_at`, `+au.N`) so provenance churn doesn't
+    false-positive as "moved" (§5 Part C, §11 #2). Also confirmed the exact
+    release endpoint `api.github.com/repos/databricks/cli/releases/latest`
+    (§5 Part D, §11 #3) and the placement/compute/read-only claims. **No
+    BLOCKING.**
+  - **`pi` structure — no BLOCKING, no numbering bug**, all cross-file citations
+    resolve (including that the `§11 #7` references are correctly *cross-file* to
+    Build Plan 04). Two NITs fixed: added §11 #6 to the header callout's
+    enumerated list; normalized the `updated_version` → `metadata.version` field
+    name (§ header callout, §1) so both comparison sides use §5's vocabulary.
+  - **Source-doc alignment (non-destructive):** `PROJECT-PLAN.md` §2 Phase 4
+    used the pre-§5 term `updated_version` for the field §5 finalized as
+    `metadata.version`; normalized those references so the source doc and this
+    plan use one name.

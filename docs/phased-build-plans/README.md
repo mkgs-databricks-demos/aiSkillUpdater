@@ -27,7 +27,7 @@ an independent sub-agent lens before being marked ready.
 | 03 | [`03-findings-ingestion-pipeline.md`](03-findings-ingestion-pipeline.md) | Phase 2b | Cross-reviewed (codex + pi) |
 | 04 | [`04-review-app.md`](04-review-app.md) | Phase 3 | Cross-reviewed (codex + pi) |
 | 05 | [`05-local-installer.md`](05-local-installer.md) | Phase 5 | Cross-reviewed (codex + pi) |
-| 06 | [`06-cli-drift-detection.md`](06-cli-drift-detection.md) | Phase 4 | Draft — cross-review pending |
+| 06 | [`06-cli-drift-detection.md`](06-cli-drift-detection.md) | Phase 4 | Cross-reviewed (codex + pi) |
 | 07 | `07-guardrails-and-observability.md` | Phase 7 | Not started |
 | 08 | `08-knowledge-base-search-and-mcp-server.md` | Phase 6 (stretch) | Not started |
 

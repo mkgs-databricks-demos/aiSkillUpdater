@@ -933,7 +933,7 @@ which is what DAB targets are for.
 - **Versioning scheme** (see §5 for the concrete format): every skill file
   this project manages carries `base_cli_version` (the `aitools`/CLI version
   it started from) and its own independently-incrementing
-  `updated_version` / `updated_at`. This never touches or overwrites the
+  `metadata.version` / `updated_at`. This never touches or overwrites the
   CLI's own version string. **The queryable version-tracking table this
   phase's three-way comparison reads/writes lives in Lakebase (§1c)**, not
   Delta — the `SKILL.md` frontmatter in the repo stays the authoritative
@@ -949,11 +949,11 @@ which is what DAB targets are for.
   that ref's `manifest.json` + skill files directly via the same
   `raw.githubusercontent.com` pattern the CLI itself uses. Compare the
   fetched content + its `SKILL.md` `metadata.version` against the
-  corresponding row's `base_cli_version` + `updated_version` in this
+  corresponding row's `base_cli_version` + `metadata.version` in this
   project's tracking table. Three outcomes per skill:
   1. CLI's shipped content is newer/equal → surface "CLI has caught up,
      consider re-basing your local copy onto the CLI's version instead."
-  2. This project's `updated_version` is still ahead → no action needed,
+  2. This project's `metadata.version` is still ahead → no action needed,
      flag informationally.
   3. Both have diverged independently since the shared `base_cli_version` →
      flag as a **conflict requiring human reconciliation** (three-way diff
