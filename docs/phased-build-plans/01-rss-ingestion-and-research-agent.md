@@ -645,12 +645,17 @@ task sequencing, not a DB transaction.
       absent/`batch` the Job runs the steps 11–20 path unchanged; branch on
       `mode` at entry.
     - **Source resolution:** this mode does **not** read `rss_silver` by
-      watermark. Resolve the single source entry by looking up `research_log_id`
-      in `research_log` (Build Plan 03 §4) to recover its originating
-      `rss_silver` entry (`guid`/`link` + fetched context needed for step 12).
-      `research_log_id` is not reversible (it is a content hash — Build Plan 03
-      §11 #1), so the `research_log` row is the required lookup, not a
-      recomputation.
+      watermark. Look up `research_log_id` in `research_log` (Build Plan 03 §4)
+      to recover the `installation_id` + `rss_guid`, then **fetch the full
+      source row from `rss_silver`** by (`installation_id`, `guid`) for the
+      `link` **and the `description`/body** that step 12 needs to discover
+      referenced URLs. `research_log` alone is **insufficient** here: Build Plan
+      03 §4's `research_log` carries `rss_guid`/`rss_link`/`rss_title`/`pub_date`/
+      `source_feed_clouds` but **not** the original `description`/body/
+      `categories`. `rss_silver` persists these (it is the same table the batch
+      path reads), so it is the required source. `research_log_id` is not
+      reversible (content hash — Build Plan 03 §11 #1), so this is a lookup, not
+      a recomputation.
     - **Behavior:** re-run steps 12–18 for that **one** entry, with exactly two
       differences from the batch path: (a) step 15's `ai_classify` call is
       **replaced by the fixed `override_label`** — the user has already chosen
@@ -661,10 +666,21 @@ task sequencing, not a DB transaction.
       App token, and step 19's per-function non-throwing error capture still
       applies.
     - **Output:** write a findings file (§4 schema) for that single entry under
-      `override_label` with `status: "pending_review"`. Build Plan 03's pipeline
-      re-ingests it to the **same** `research_log_id` (stable per Build Plan 03
-      §11 #1), so the Review App card refreshes in place rather than creating a
-      duplicate row (Build Plan 04 §5 Part D step 13).
+      `override_label` with `status: "pending_review"`. **The regenerated
+      finding gets a *different* `research_log_id`** — Build Plan 03 keys the id
+      as `rl_ + sha2(installation_id : rss_guid : label)` (Build Plan 03 §11 #1)
+      and the `label` component changed, so this is (correctly) a distinct
+      `(entry × label)` row, not an in-place rewrite. Build Plan 03's model
+      already holds multiple `research_log` rows per entry (multilabel
+      classification), so **no Build Plan 03 change is needed**; the original
+      wrong-label row remains as system-of-record history (review decisions
+      never mutate `research_log`). Reviewer continuity is the Review App's
+      responsibility, **not** `research_log_id` sameness: the stable object is
+      Build Plan 04's `review_items` row (its own `review_item_id` PK), which
+      **re-points its `research_log_id` FK** from the original to the
+      regenerated finding so the card refreshes in place — Build Plan 04 §5
+      Part D step 13 owns this, and must suppress the normal "first sighting"
+      auto-creation of a second `review_items` row for the new id.
     - **Watermark isolation:** this mode neither reads nor advances
       `rss_silver_watermark` (steps 11 and 20 are skipped), so a regeneration
       run and a concurrent `table_update`-triggered batch run cannot corrupt
@@ -1021,6 +1037,26 @@ gap Build Plan 04 opened (its §5 Part D / §6 / §11 #2) for the
 classification-override re-trigger. The mode reuses steps 12–18 for one
 `research_log_id`, replaces step 15's `ai_classify` with the user's fixed
 `override_label`, skips the watermark (steps 11/20), and writes a findings
-file Build Plan 03 re-ingests to the same `research_log_id`. Build Plan 04's
-three references were updated in the same amendment to cite this now-specified
-contract rather than describing an unfilled gap. Pending cross-review.
+file Build Plan 03 re-ingests. Build Plan 04's four references (§1 callout, §5
+Part D step 12, §6, §11 #2) were updated in the same amendment to cite this
+now-specified contract rather than describing an unfilled gap.
+
+**Amendment cross-review fold-in (`codex` mechanics + `pi` structure):** `pi`
+confirmed structure sound (step 21 continues Part F's global numbering, no
+off-by-N; all cross-file citations resolve; parameter triple identical on both
+sides) — its one NIT (Build Plan 01 changelog said "three references" when four
+were updated) is fixed above. `codex` found **two BLOCKING** contract errors,
+both fixed: (1) the amendment claimed the regenerated finding re-ingests to the
+**same** `research_log_id`, but Build Plan 03 keys the id on `label`
+(`rl_ + sha2(installation_id:rss_guid:label)`), so an override necessarily
+yields a **different** id — corrected §5 Part F step 21's Output bullet to make
+the new id by-design (a distinct `(entry × label)` row; Build Plan 03 needs no
+change since it already holds multiple rows per entry) and moved reviewer
+continuity to Build Plan 04's `review_items` re-point rather than id sameness;
+(2) source recovery read only `research_log`, which lacks the original
+`description`/body step 12 needs — corrected the Source-resolution bullet to
+fetch the full row from `rss_silver` (by `installation_id`+`guid`), with
+`research_log` supplying only the guid. Build Plan 04 §5 Part D step 13 and its
+cross-store integrity note were updated in lockstep, and its stale
+"Part D is blocked on a Build Plan 01 change" fan-out sequencing (a `codex` NIT)
+now reads as a specified dependency pending a build-time parameter-name check.

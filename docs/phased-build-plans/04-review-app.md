@@ -193,7 +193,12 @@ from prior overrides (Build Plan 04)") — this is the table it reads.
 DB-level FK. The stability of `research_log_id` (Build Plan 03 §11 #1 —
 content-addressed, stable across re-ingestion) is what makes these
 cross-store references safe; call out that a re-ingested finding keeps the same
-id, so a pending review item does not dangle.
+id, so a pending review item does not dangle. **Note the one exception —
+classification override:** because the id hashes the `label`, an override
+produces a finding under a *new* id (not a dangling reference but a deliberate
+re-point). Part D step 13 handles this by moving the `review_items` row's
+`research_log_id` to the regenerated finding; `classification_overrides`
+retains the original id as the audit anchor.
 
 ## 5. Task breakdown
 
@@ -275,9 +280,21 @@ id, so a pending review item does not dangle.
       plan opened the gap); see §6 and §11 #2. Confirm the exact parameter names
       match Build Plan 01 §5 Part F step 21 at build time — both sides must
       agree.
-13. When regeneration completes, Build Plan 03's pipeline lands a new/updated
-    `research_log` row (same `research_log_id`, stable per its §11 #1), and the
-    card refreshes to show the diff grounded in the human-confirmed label.
+13. When regeneration completes, Build Plan 03's pipeline lands a **new**
+    `research_log` row for the corrected `(entry × override_label)` — a
+    **different** `research_log_id` than the original, because Build Plan 03
+    keys the id on `label` (Build Plan 03 §11 #1) and the label changed. This is
+    by design (a distinct classification row; Build Plan 03 already holds
+    multiple rows per entry for multilabel results), so no Build Plan 03 change
+    is needed. Re-point **this** `review_items` row's `research_log_id` FK
+    (stable `review_item_id`) from the original to the regenerated finding and
+    refresh the card in place; `classification_overrides.research_log_id` keeps
+    the **original** id as the audit record of what was reclassified.
+    **Suppress** the Part B "first sighting" path from auto-creating a *second*
+    `review_items` row when the new finding's `research_log_id` lands (reconcile
+    it to the override's `regeneration_run_id` / existing `review_item`), so the
+    corrected finding refreshes the existing card rather than enqueuing a
+    duplicate.
 
 ### Part E — Accept → open a PR to the configured skills repo (`-app` → GitHub)
 14. On **accept**, open a **pull request** against this installation's
@@ -406,14 +423,17 @@ per-installation scoping are agreed):**
     diff renderer as Part C, so sequence it after E and C.
   - Part G (Skill Library browser) — shares Part E's PR/frontmatter path; can
     be built alongside F.
-- **Part D (override re-trigger) is blocked** on the Build Plan 01 entry-point
-  contract (§6, §11 #2) — do not start it until that is reconciled.
+- **Part D (override re-trigger)** depends on Build Plan 01's now-specified
+  `mode=regenerate_single` entry point (§6, §11 #2 — Build Plan 01 §5 Part F
+  step 21); at build time confirm the parameter names agree on both sides
+  before starting it.
 
 **Across plans:**
 - **Blocked on Build Plan 00** (Lakebase schema/SP, GitHub App token) and
   **Build Plan 03** (`research_log` populated). Hard sequential.
-- **Blocked on a Build Plan 01 change** for Part D only (the regeneration entry
-  point). Parts A–C, E–G do not need it.
+- **Depends on Build Plan 01's `mode=regenerate_single` entry point** (now
+  specified — Build Plan 01 §5 Part F step 21) for Part D only; confirm
+  parameter-name agreement at build. Parts A–C, E–G do not need it.
 - **Feeds Build Plan 05** (Local Installer — consumes Part E's accept hook) and
   **Build Plan 06** (Phase 4 three-way conflict UI — renders inside Part G's
   browser). Define the extension points; don't build those here.
@@ -550,3 +570,17 @@ per-installation scoping are agreed):**
   `override_label`, `installation_id`) agree on both sides. The historical
   "Initial draft" changelog entry above is left as-is (accurate record of the
   gap as first surfaced).
+- **Amendment cross-review fold-in (`codex` mechanics + `pi` structure).**
+  `codex` caught two BLOCKING contract errors in the first cut of the
+  amendment, both fixed here: (1) a label override changes `research_log_id`
+  (Build Plan 03 keys the id on `label`), so §5 Part D step 13 now describes the
+  regenerated finding as a **new** `research_log_id` with **this**
+  `review_items` row re-pointing its FK to it (and suppressing a duplicate
+  "first sighting" enqueue), rather than an in-place same-id refresh; the
+  cross-store integrity note (§4) gained the matching override exception. (2)
+  Source recovery must read `rss_silver` (not just `research_log`) for the
+  announcement body — fixed on the Build Plan 01 side. `codex` also flagged
+  stale "Part D is blocked on a Build Plan 01 change" fan-out text (§8), now
+  reworded to a specified dependency pending a parameter-name check. `pi`
+  confirmed the four updated references are mutually consistent and all
+  citations resolve.
