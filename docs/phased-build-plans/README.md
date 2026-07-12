@@ -25,7 +25,7 @@ an independent sub-agent lens before being marked ready.
 | 01 | [`01-rss-ingestion-and-research-agent.md`](01-rss-ingestion-and-research-agent.md) | Phase 2 | Cross-reviewed (codex + pi) |
 | 02 | [`02-grounding-corpus.md`](02-grounding-corpus.md) | Phase 1 | Cross-reviewed (codex + pi) |
 | 03 | [`03-findings-ingestion-pipeline.md`](03-findings-ingestion-pipeline.md) | Phase 2b | Cross-reviewed (codex + pi) |
-| 04 | `04-review-app.md` | Phase 3 | Not started |
+| 04 | [`04-review-app.md`](04-review-app.md) | Phase 3 | Draft — cross-review pending |
 | 05 | `05-local-installer.md` | Phase 5 | Not started |
 | 06 | `06-cli-drift-detection.md` | Phase 4 | Not started |
 | 07 | `07-guardrails-and-observability.md` | Phase 7 | Not started |
