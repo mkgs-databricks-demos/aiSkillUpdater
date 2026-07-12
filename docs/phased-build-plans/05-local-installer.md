@@ -9,10 +9,12 @@ it does not re-litigate design decisions already locked there — if something
 here seems to conflict with `PROJECT-PLAN.md`, that file wins and this plan is
 stale.
 
-**Cross-reviewed:** _pending_ — a first draft. An independent structural pass
-(`pi`) and an independent Databricks/mechanics fact-check pass (`codex`) will
-review this draft; every BLOCKING finding from both will be folded into a
-revised version, with a changelog at the bottom.
+**Cross-reviewed:** an independent structural pass (`pi`) and an independent
+Databricks/mechanics fact-check pass (`codex`) both reviewed a first draft of
+this plan; every BLOCKING finding from both is folded into the version below,
+and cross-review resolved two previously-open gaps (Antigravity's path and the
+plugin-state detection signal) directly from CLI source. See the changelog at
+the bottom of this file.
 
 **What this phase is, in one sentence:** the mechanism that takes a skill
 change the human already approved in the Review App (Build Plan 04) and gets it
@@ -40,13 +42,14 @@ and the instructions, plus the git PR path Build Plan 04 already owns. See
 > explicit, flagged choices for: **how `apply-skill.sh` gets seeded into a
 > from-scratch configured repo** (§5 Part A, §11 #1); the script's **input /
 > idempotency / backup contract** (§5 Part A, §11 #2); the **plugin-vs-raw
-> detection heuristic per agent** — the single biggest correctness risk here,
-> currently *unverified* (§5 Part A step 4, §7, §11 #3); **Antigravity's
-> skill-directory path, which `PROJECT-PLAN.md` does not actually document**
-> even though Antigravity is in the target set (§4, §11 #4); and the
-> **signed-URL mechanism** for the download fallback (§5 Part B, §11 #5). Each
-> discretionary choice is consolidated in §11 for the repo owner and
-> cross-review to confirm or override.
+> detection heuristic per agent** — the single biggest correctness risk, now
+> pinned to a concrete CLI-source signal by cross-review (§5 Part A step 4, §7,
+> §11 #3); **Antigravity's skill-directory path** — undocumented in
+> `PROJECT-PLAN.md`, now resolved from CLI source by cross-review (§4, §11 #4);
+> the **download-fallback delivery mechanism** (§5 Part B, §11 #5); and whether
+> to build the **optional File System Access button** at all this phase (§5
+> Part C, §11 #6). Each discretionary choice is consolidated in §11 for the
+> repo owner and cross-review to confirm or override.
 
 ---
 
@@ -96,7 +99,8 @@ doesn't remove the code-execution concern, just relocates it).
   starting-point flow (scratch vs. starter pack).
 - **The §5 versioning frontmatter scheme** is stable (defined in
   `PROJECT-PLAN.md` §5; Build Plan 04 §5 Part E step 15 already writes it into
-  the PR'd files). The script re-asserts the same scheme on the files it
+  the PR'd files). The script copies that frontmatter **verbatim from the
+  merged repo** onto the files it
   writes locally, so provenance is consistent between the repo and the local
   copy.
 - **A machine with one or more supported agents installed**, for realistic
@@ -109,7 +113,7 @@ doesn't remove the code-execution concern, just relocates it).
 |---|---|---|
 | The "apply to this machine" App UI + download-fallback endpoint (§5 Part B) | `-app` | Part of the Databricks App (§1d places Phase 5 in `-app`). Extends Build Plan 04's App; not a new deployable. |
 | `apply-skill.sh` itself | **not in any project bundle** | It lives in the *user's configured skills repo* (§1a), committed there (from the starter-pack seed, or added at first setup for a from-scratch repo — §11 #1). It is not shipped by this project's `-infra`/`-ai-tools`/`-app` bundles. This is the key placement subtlety: the primary deliverable is authored here but *deployed into someone else's repo*, not into a DAB. |
-| Signed-URL storage for the download fallback (§5 Part B) | *open — §11 #5* | Depends on the signing mechanism chosen (e.g. a UC Volume with a short-TTL signed URL vs. an App-served ephemeral endpoint). |
+| Download-fallback delivery for the one-off script (§5 Part B) | `-app` *(preferred)* | Cross-review recommends an App-served ephemeral endpoint (authz + nonce/expiry + `Content-Disposition: attachment`) over a UC Volume signed URL unless a native signed-URL mechanism is confirmed (§11 #5). |
 
 **No new Lakebase tables.** This plan adds no `-infra`/`-ai-tools` resources
 and no new OLTP state; it is a local-execution script plus an App affordance
@@ -143,12 +147,15 @@ machine**:
 | Codex CLI | `~/.codex/skills` |
 | GitHub Copilot | `~/.copilot/skills` |
 | OpenCode | `${XDG_CONFIG_HOME:-~/.config}/opencode/skills` (or `$APPDATA/opencode/skills` on Windows) |
-| Antigravity | **NOT documented in `PROJECT-PLAN.md`** despite being in the target set — must be resolved from CLI source before the script can target it (§11 #4) |
+| Antigravity | `~/.gemini/antigravity/global_skills` — **not** documented in `PROJECT-PLAN.md`; resolved from CLI source during cross-review (`ConfigDir ~/.gemini/antigravity` + `SkillsSubdir global_skills`; raw-file agent, no plugin mode). Confirm at build (§11 #4). |
 
 **Every written file carries the §5 provenance frontmatter** (`metadata.version`,
 `base_cli_version`, `base_skills_repo_ref`, `updated_at`, `last_research_log_id`,
 `availability`) so Build Plan 06's drift check can identify what this installer
-placed and from which base.
+placed and from which base. The script **copies this frontmatter verbatim from
+the merged repo** (the source of truth post-merge); it never re-generates or
+re-increments it — that increment is Build Plan 04 §5 Part E step 15's job on
+accept.
 
 ## 5. Task breakdown
 
@@ -173,15 +180,25 @@ placed and from which base.
    Code/Codex/Copilot (only Cursor/OpenCode/Antigravity get raw files by
    default), so blindly writing raw files into `~/.claude/skills/` can be
    silently overwritten/conflict on the next `aitools install`/plugin update.
-   Before writing, detect whether each agent is plugin-managed (e.g. inspect
-   the CLI's own `.state.json` / plugin records) and either (a) write raw only
-   when the agent is in raw mode, or (b) warn + require an explicit
-   `--force-raw` when it's plugin-managed. **This heuristic is unverified** —
-   see §7 / §11 #3; it must be validated against real installs at build time.
+   Before writing, detect whether each agent is plugin-managed by reading the
+   CLI's plugin-state file — **resolved from CLI source during cross-review**:
+   `~/.databricks/aitools/skills/.state.json` (global) or
+   `<cwd>/.databricks/aitools/skills/.state.json` (project), whose `plugins`
+   object is keyed by agent name (`claude-code`, `codex`, `copilot`) with values
+   `{marketplace, plugin, scope, version, installed_marketplace?}`. If an agent
+   has a plugin record it is plugin-managed; then either (a) write raw only for
+   agents in raw mode, or (b) warn + require an explicit `--force-raw`. The CLI
+   is plugin-first unless `--skills-only` and does **not** silently fall back to
+   raw on plugin failure. Confirm this signal against a real install at build
+   (§7 / §11 #3).
 5. **Write with provenance**: write each skill to the detected agents' paths,
-   stamping the §5 frontmatter (§4). For Claude Code, default to the global
-   `~/.claude/skills` unless a project-scope flag is given; handle the
-   OpenCode Windows `$APPDATA` path.
+   **copying the §5 frontmatter verbatim from the merged repo** (§4) — the repo
+   is the source of truth post-merge, so the script must **not** re-generate or
+   re-increment `metadata.version` / `last_research_log_id` (that increment is
+   Build Plan 04 §5 Part E step 15's job on accept). For Claude Code, default to
+   the global `~/.claude/skills` unless a project-scope flag is given; handle the
+   OpenCode Windows `$APPDATA` path and Antigravity's
+   `~/.gemini/antigravity/global_skills` (§4).
 6. **Report**: print a clear per-agent summary (applied / skipped-absent /
    skipped-plugin-managed / backed-up), so the user knows exactly what changed.
 
@@ -189,17 +206,21 @@ placed and from which base.
 7. Implement Build Plan 04 §5 Part E step 16's **"apply to this machine"
    affordance**: for a repo-cloned user, show the exact `git pull &&
    ./apply-skill.sh` (or scoped) command; do not attempt any server-side local
-   write (impossible — §What-this-phase-is).
+   write (impossible — see the architectural lead-in at the top of this plan).
 8. **Download fallback**: for users without the repo, generate the same script
-   content as a one-off download from a **short-TTL signed URL** (§11 #5),
-   file-writes only (no remote `eval`), and render it for the user to read
-   **before** they run it — never a silent `curl | bash`.
+   content as a one-off download. **Prefer an App-served ephemeral endpoint**
+   (authorization + a nonce/expiry + `Content-Disposition: attachment`) over
+   assuming a UC Volume short-TTL signed URL, unless a native signed-URL
+   mechanism is confirmed at build (§11 #5). File-writes only (no remote
+   `eval`), and render it for the user to read **before** they run it — never a
+   silent `curl | bash`.
 9. Keep both affordances **gated behind an accepted item** (the PR/merge is the
    real gate); the installer never applies something that wasn't accepted in
    Build Plan 04.
 
 ### Part C — Optional File System Access API button (`-app`, Chromium-only, convenience)
-10. Behind a clearly-optional, Chromium-only affordance, use the browser
+10. Behind a clearly-optional, **feature-detected Chromium-family** affordance
+    (§11 #6), use the browser
     **File System Access API** to let the user grant folder access and write
     the approved files directly — with the same §5 frontmatter and the same
     plugin-vs-raw caution surfaced as a warning (the browser can't run the
@@ -237,21 +258,23 @@ placed and from which base.
   No server-side local write exists; the App only produces script/content +
   instructions.
 - **Plugin-first default for Claude Code/Codex/Copilot** (`PROJECT-PLAN.md` §2
-  Phase 5): raw-file writes to those agents can be clobbered by the next
-  plugin/`aitools install` update. The plugin-vs-raw detection heuristic (§5
-  Part A step 4) is the mitigation — **and is currently unverified**; confirm
-  the actual detection signal (the CLI's `.state.json` / plugin-record
-  location and shape) against a real install before relying on it. Treat as
-  the top build-time verification item.
-- **Antigravity path undocumented** (§4, §11 #4): in the target set but its
-  skill directory isn't recorded anywhere in `PROJECT-PLAN.md`; resolve from
-  CLI source before the script targets it, or the script must degrade to
-  "skip Antigravity with a clear message" until it is known.
+  Phase 5; the CLI is plugin-first unless `--skills-only` and never silently
+  falls back to raw): raw-file writes to those agents can be clobbered by the
+  next plugin/`aitools install` update. The plugin-vs-raw detection heuristic
+  (§5 Part A step 4) is the mitigation — the detection signal is now **resolved
+  from CLI source** (`~/.databricks/aitools/skills/.state.json` global /
+  `<cwd>/.databricks/aitools/skills/.state.json` project, `plugins` keyed by
+  agent name); confirm it still holds against a real install at build.
+- **Antigravity path** (§4, §11 #4): undocumented in `PROJECT-PLAN.md`, now
+  resolved from CLI source to `~/.gemini/antigravity/global_skills` (a raw-file
+  agent, no plugin mode); confirm at build. Until confirmed, the script may
+  still degrade to "skip Antigravity with a clear message."
 - **`curl | bash` safety** — the download fallback must be shown to the user
   before execution and scoped to file-writes only; no remote `eval`, no silent
   piping.
-- **File System Access API is Chromium-only** — the Part C button must
-  feature-detect and hide/disable on non-Chromium browsers rather than error.
+- **File System Access API is Chromium-family only (feature-detected, not a
+  timeless absolute)** — the Part C button must feature-detect and
+  hide/disable where unsupported rather than error.
 
 ## 8. Explicit fan-out map
 
@@ -333,17 +356,22 @@ placed and from which base.
    Single-skill vs. list vs. full-sync default; the exact backup scheme
    (timestamped `.bak` vs. a backup dir); confirm idempotency semantics.
 3. **Plugin-vs-raw detection heuristic per agent (§5 Part A step 4, §7).** The
-   biggest correctness risk. The exact detection signal (the CLI's
-   `.state.json` / plugin-record path and shape for Claude Code/Codex/Copilot)
-   is **unverified** and must be validated against a real plugin-managed install
-   at build time. Until verified, default to the safe behavior (warn + require
-   `--force-raw`).
-4. **Antigravity's skill-directory path (§4).** In the target agent set but
-   **not documented in `PROJECT-PLAN.md`**; resolve from CLI source before the
-   script targets it, or the script skips Antigravity with a clear message.
-5. **Signed-URL mechanism for the download fallback (§3, §5 Part B).** How the
-   App serves the one-off script over a short-TTL signed URL — UC Volume signed
-   URL vs. an App-served ephemeral endpoint — and where that content is stored.
+   biggest correctness risk, now **resolved from CLI source** in cross-review:
+   `~/.databricks/aitools/skills/.state.json` (global) /
+   `<cwd>/.databricks/aitools/skills/.state.json` (project), `plugins` keyed by
+   agent name (`claude-code`/`codex`/`copilot`) with values
+   `{marketplace, plugin, scope, version, installed_marketplace?}`. Confirm it
+   still holds against a real plugin-managed install at build; keep the safe
+   default (warn + require `--force-raw`) if a record is ambiguous.
+4. **Antigravity's skill-directory path (§4).** Undocumented in
+   `PROJECT-PLAN.md`, now **resolved from CLI source** in cross-review to
+   `~/.gemini/antigravity/global_skills` (a raw-file agent). Confirm at build;
+   until then the script may skip Antigravity with a clear message.
+5. **Download-fallback delivery mechanism (§3, §5 Part B).** Cross-review
+   recommends an **App-served ephemeral endpoint** (authorization + nonce/expiry
+   + `Content-Disposition: attachment`) over a UC Volume short-TTL signed URL,
+   unless a native signed-URL mechanism is confirmed at build. Confirm the
+   chosen mechanism and where (if anywhere) the content is stored.
 6. **File System Access API button (Part C).** Whether to build the optional
    Chromium-only convenience path at all in this phase, or defer it — it is
    explicitly optional and non-blocking.
@@ -359,3 +387,34 @@ placed and from which base.
   skill path is undocumented in `PROJECT-PLAN.md`** despite being in scope
   (§4 / §11 #4), and the **plugin-vs-raw detection heuristic is unverified**
   and is the top build-time correctness risk (§5 Part A step 4 / §7 / §11 #3).
+- **Cross-review fold-in (`codex` mechanics + `pi` structure).**
+  - **`pi` BLOCKING B1 — frontmatter copy-vs-regenerate ambiguity.** "Stamping
+    the §5 frontmatter" could be misread as re-generating/re-incrementing it
+    (which would need Build Plan 04's `+au.N` rule). Clarified in §2, §4, and §5
+    Part A step 5 that the script **copies the frontmatter verbatim from the
+    merged repo** (source of truth post-merge) and never re-increments it — that
+    increment is Build Plan 04 §5 Part E step 15's job on accept.
+  - **`codex` resolved §11 #4 (Antigravity path) from CLI source.** Antigravity =
+    `~/.gemini/antigravity/global_skills` (`ConfigDir ~/.gemini/antigravity` +
+    `SkillsSubdir global_skills`; raw-file agent). Upgraded §4 table, §7, §11 #4,
+    and §5 Part A step 5 from "undocumented/unknown" to the resolved path
+    (confirm-at-build).
+  - **`codex` resolved §11 #3 (plugin-state detection) from CLI source.** The
+    signal is `~/.databricks/aitools/skills/.state.json` (global) /
+    `<cwd>/.databricks/aitools/skills/.state.json` (project), a `plugins` object
+    keyed by agent name (`claude-code`/`codex`/`copilot`) with
+    `{marketplace, plugin, scope, version, installed_marketplace?}`. Upgraded §5
+    Part A step 4, §7, and §11 #3 from "unverified" to "resolved, confirm at
+    build," and noted the CLI is plugin-first unless `--skills-only` with no
+    silent raw fallback.
+  - **`codex` NIT — download mechanism.** Prefer an App-served ephemeral endpoint
+    (authz + nonce/expiry + `Content-Disposition: attachment`) over a UC Volume
+    signed URL unless a native signed-URL mechanism is confirmed; refined §3, §5
+    Part B step 8, and §11 #5. **`codex` NIT — FSA wording** changed to
+    "feature-detected Chromium-family" (§7, §5 Part C).
+  - **`pi` NITs.** Added an inbound `§11 #6` pointer from §5 Part C and included
+    #6 in the header callout's enumerated choices; fixed the `§What-this-phase-is`
+    pseudo-anchor in §5 Part B step 7 to point at the architectural lead-in. `pi`
+    found **no numbering off-by-N bug** and verified all cross-file citations
+    (Build Plan 04 §5 Part E steps 15/16, Build Plan 00 §4, PROJECT-PLAN §2
+    Phase 5 / §1a / §5 / §1d) resolve.
