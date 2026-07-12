@@ -10,10 +10,10 @@ needed to build Phase 3; it does not re-litigate design decisions already
 locked there — if something here seems to conflict with `PROJECT-PLAN.md`,
 that file wins and this plan is stale.
 
-**Cross-reviewed:** _pending_ — a first draft. An independent structural pass
-(`pi`) and an independent Databricks/Apps-mechanics fact-check pass (`codex`)
-will review this draft; every BLOCKING finding from both will be folded into a
-revised version, with a changelog at the bottom.
+**Cross-reviewed:** an independent structural pass (`pi`) and an independent
+Databricks/Apps-mechanics fact-check pass (`codex`) both reviewed a first draft
+of this plan; every BLOCKING finding from both is folded into the version
+below. See the changelog at the bottom of this file.
 
 **What this phase is, in one sentence:** a Databricks App (AppKit + React)
 that reads the `research_log` entries produced by Build Plan 03 and presents a
@@ -81,9 +81,10 @@ mechanism (Build Plan 05 — this plan only exposes the accept-time hook and the
 "apply locally" affordance); the three-way CLI-drift conflict *detection*
 (Build Plan 04 = Phase 3 owns only the App shell that Build Plan 06 / Phase 4
 will later render its three-way conflict UI inside); the KB/MCP server (Build
-Plan 08); the maintainer-only upstream-PR path (`PROJECT-PLAN.md` §4 open item,
-deliberately deferred nice-to-have — this plan must not surface it to
-non-maintainer users, but does not build it).
+Plan 08); the maintainer-only upstream-PR path (`PROJECT-PLAN.md` §6 open
+question #4, deliberately deferred nice-to-have — this plan must not surface it
+to non-maintainer users, but does not build it; see §11 #8 for the gate this
+plan must design around).
 
 ## 2. Prerequisites
 
@@ -222,8 +223,11 @@ id, so a pending review item does not dangle.
    §1c) — with §1c's caveats: synced tables are read-only in Postgres (writes
    corrupt the sync), the App SP needs an explicit GRANT to read them
    (`CAN_CONNECT_AND_CREATE` alone is insufficient), row/column ACLs are not
-   propagated, and creation is via `databricks postgres create-synced-table`,
-   not a DAB resource. Do **not** reach for this up front.
+   propagated, and creation is via `databricks postgres create-synced-table`
+   (the `databricks-lakebase` skill notes DAB support for autoscaling synced
+   tables is "not yet available" — treat "not a DAB resource" as a
+   version-sensitive claim to re-check against live docs at build time, not as
+   timeless). Do **not** reach for this up front.
 6. Join each `research_log` row to its `review_items` row (by
    `research_log_id`, creating a `pending` `review_items` row on first sighting
    if absent) so the queue reflects Lakebase-owned decision state layered over
@@ -499,8 +503,8 @@ per-installation scoping are agreed):**
 8. **Reviewer authorization model.** Who may accept/reject/override (any
    workspace user with App access vs. a designated reviewer role), and the
    identity gate that must keep the deferred maintainer-only upstream-PR path
-   (`PROJECT-PLAN.md` §4) invisible to non-maintainers. Not built here, but the
-   gate's existence must be designed for.
+   (`PROJECT-PLAN.md` §6 open question #4) invisible to non-maintainers. Not
+   built here, but the gate's existence must be designed for.
 
 ## 12. Changelog
 
@@ -515,3 +519,21 @@ per-installation scoping are agreed):**
   data model with a two-origin `review_items` table (§4), and App-backend
   ownership of the §5 frontmatter version bump on both accept and editor-save
   (§5 Part E step 15).
+- **Cross-review fold-in (`codex` mechanics + `pi` structure).**
+  - **`pi` BLOCKING B1 — wrong `PROJECT-PLAN.md` section cited (2 sites).** The
+    maintainer-only upstream-PR path was cited as `PROJECT-PLAN.md §4`
+    ("Suggested build order"); the actual content is `§6` open question #4.
+    Corrected both occurrences (§1 out-of-scope and §11 #8), and added an
+    inbound `§11 #8` pointer from the §1 mention (resolving `pi`'s NIT that
+    §11 #8 had no inbound reference). `pi` otherwise found **no numbering
+    off-by-N bug** (all 21 steps across Parts A–G sequential) and verified every
+    cross-file citation (BP00 §4, BP01 Part F/§10, BP03 §4, and the §5
+    frontmatter / §1a / §1c / §1d claims) resolves.
+  - **`codex` NIT — synced-table "not a DAB resource" is version-sensitive.**
+    The `databricks-lakebase` skill itself notes DAB support for autoscaling
+    synced tables is "not yet available," so §5 Part B step 5 now frames "not a
+    DAB resource" as a build-time live-doc recheck, not a timeless fact. `codex`
+    found **no BLOCKING mechanics errors** and confirmed the Data Access Gate,
+    `jobs()` fire-and-poll + 120 s timeout, GitHub App token-mint model, AppKit
+    lock-in, `research_log` VARIANT reads, and the real BP01 regeneration gap
+    (§11 #2) are all mechanically sound.
